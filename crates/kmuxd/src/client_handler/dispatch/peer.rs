@@ -14,6 +14,14 @@ pub(super) async fn on_open_peer(
     // sessions locally. With the `federation` feature off, `open_peer`
     // returns a "not supported" error and this becomes a `PeerError`
     // the client can surface.
+    if target == PeerTarget::Unknown {
+        state.send(ServerMessage::PeerError {
+            request_id,
+            peer: None,
+            reason: crate::app::UNSUPPORTED_PEER_TARGET.to_string(),
+        });
+        return;
+    }
     let peer_hint = target.peer_id();
     match state.app.open_peer(target).await {
         Ok(peer) => state.send(ServerMessage::PeerOpened { request_id, peer }),
@@ -34,6 +42,28 @@ pub(super) fn on_close_peer(state: &mut SharedClientState, request_id: RequestId
 #[cfg(test)]
 mod tests {
     use super::super::testing::*;
+
+    #[tokio::test]
+    async fn open_peer_with_a_target_kind_this_daemon_does_not_know_answers_peer_error() {
+        let (keep, msgs) = dispatch_one(ClientMessage::OpenPeer {
+            request_id: 17,
+            target: PeerTarget::Unknown,
+        })
+        .await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::PeerError {
+                request_id,
+                peer,
+                reason,
+            } => {
+                assert_eq!(request_id, 17);
+                assert_eq!(peer, None);
+                assert!(reason.contains("does not support"), "{reason}");
+            }
+            other => panic!("expected PeerError, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn open_peer_that_cannot_be_reached_answers_peer_error_naming_the_peer() {

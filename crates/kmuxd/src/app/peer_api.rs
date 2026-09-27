@@ -19,6 +19,11 @@ use tokio::sync::mpsc;
 
 use super::ServerApp;
 
+/// The `PeerError` reason for an `OpenPeer` whose target is a kind this
+/// daemon does not know (`PeerTarget::Unknown`, from a newer client).
+pub(crate) const UNSUPPORTED_PEER_TARGET: &str =
+    "this daemon does not support that kind of peer target; update kmuxd";
+
 impl ServerApp {
     /// Draw a unique session word from the shared pool, or `None` when exhausted.
     /// Federated sessions use this so their local IDs never collide with

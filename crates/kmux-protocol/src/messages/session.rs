@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::wire_enum::wire_enum;
+
 pub type RequestId = u64;
 
 /// The `request_id` of a `SessionListResult` nobody asked for: the daemon
@@ -75,6 +77,7 @@ pub type TabIndex = u32;
 /// can attribute each connection (and `kmux clients` / `kmux client status` can
 /// distinguish a CLI invocation from a GUI client).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum FrontendKind {
     /// A short-lived `kmux` CLI subcommand (`ls`, `clients`, `notify`, …).
     #[default]
@@ -83,7 +86,12 @@ pub enum FrontendKind {
     Gtk,
     /// The native macOS Swift app (`kmux-swift`).
     Swift,
+    /// A frontend this build does not know, from a newer peer.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(FrontendKind);
 
 impl std::fmt::Display for FrontendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,6 +99,7 @@ impl std::fmt::Display for FrontendKind {
             Self::Cli => "cli",
             Self::Gtk => "gtk",
             Self::Swift => "swift",
+            Self::Unknown => "unknown",
         };
         f.write_str(s)
     }
@@ -131,6 +140,7 @@ pub type PeerId = String;
 /// `PeerTarget` and proxies that peer's sessions to local GUIs. The daemon maps
 /// this onto `kmux_connect`'s connect mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum PeerTarget {
     /// Reach the peer over SSH: `kmuxd probe-or-start` over SSH, then TCP+TLS
     /// through the resulting `-L` tunnel. The default for `--server user@host`.
@@ -157,7 +167,13 @@ pub enum PeerTarget {
         /// Accept a self-signed / unpinned TLS certificate on the data plane.
         accept_invalid_certs: bool,
     },
+    /// A kind of target this build does not know, from a newer client. The
+    /// daemon answers it with `PeerError`.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(PeerTarget);
 
 impl PeerTarget {
     /// The stable [`PeerId`] for this target: SSH → `"user@host"` (suffixed
@@ -182,6 +198,7 @@ impl PeerTarget {
                 }
             }
             Self::Direct { host, port, .. } => format!("{host}:{port}"),
+            Self::Unknown => "unknown".to_string(),
         }
     }
 
@@ -196,6 +213,7 @@ impl PeerTarget {
                 accept_invalid_certs,
                 ..
             } => *accept_invalid_certs,
+            Self::Unknown => false,
         }
     }
 }
@@ -272,6 +290,7 @@ pub struct DirEntry {
 /// Ghostty renders this as a thin bar in the window; kmux renders it per pane.
 /// `Remove` means no bar is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum PaneProgressState {
     /// No progress bar (cleared, or never set).
     #[default]
@@ -284,7 +303,13 @@ pub enum PaneProgressState {
     Indeterminate,
     /// Paused / warning.
     Pause,
+    /// A state this build does not know, from a newer daemon; shown as no
+    /// bar.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(PaneProgressState);
 
 /// Why a pane is asking for the user's attention (issue #169).
 ///
@@ -293,6 +318,7 @@ pub enum PaneProgressState {
 /// its lifecycle to one of these so the client can word the notification
 /// appropriately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum AttentionKind {
     /// The program finished a unit of work and is idle (e.g. Claude Code's
     /// `Stop` hook — a turn completed).
@@ -300,7 +326,13 @@ pub enum AttentionKind {
     /// The program is blocked waiting on the user (e.g. Claude Code's
     /// `Notification` hook — a permission prompt or idle input).
     NeedsInput,
+    /// A reason this build does not know, from a newer peer; worded as a
+    /// plain request for attention.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(AttentionKind);
 
 /// Snapshot of a single pane within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +416,7 @@ pub enum SplitDir {
 /// into from its current set of panes (in their existing leaf order), à la tmux's
 /// preset layouts. Used by `ApplyLayoutScheme`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum LayoutScheme {
     /// All panes in a single row (one horizontal split).
     EvenHorizontal,
@@ -393,7 +426,13 @@ pub enum LayoutScheme {
     MainVertical,
     /// A large "main" pane on top; the rest in a row along the bottom.
     MainHorizontal,
+    /// A scheme this build does not know, from a newer client; the daemon
+    /// leaves the layout as it is.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(LayoutScheme);
 
 /// A resolution-independent tiling layout for one tab.
 ///
@@ -537,6 +576,7 @@ pub enum InputMode {
 
 /// Lifecycle event relayed from the server's event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum SessionEventMsg {
     /// A new session (with its initial pane) was created.
     SessionCreated { word_id: WordId },
@@ -619,13 +659,13 @@ pub enum SessionEventMsg {
         word_id: WordId,
         tab_indices: Vec<TabIndex>,
     },
-    /// A tab's layout tree and/or focus changed. Clients should reconcile to the
-    /// authoritative tree carried by the next `LayoutUpdate` for this tab.
-    LayoutChanged {
-        word_id: WordId,
-        tab_index: TabIndex,
-    },
+    /// An event this build does not know, from a newer daemon; receivers
+    /// ignore it.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(SessionEventMsg);
 
 #[cfg(test)]
 mod tests {
@@ -955,10 +995,6 @@ mod tests {
                 tab_index: 1,
                 name: "logs".into(),
             },
-            SessionEventMsg::LayoutChanged {
-                word_id: "eagle".into(),
-                tab_index: 0,
-            },
         ] {
             let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
             let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
@@ -992,23 +1028,4 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
-}
-
-/// Error codes for structured error responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorCode {
-    AuthFailed,
-    SessionNotFound,
-    SessionAlreadyExists,
-    NotAuthenticated,
-    InvalidMessage,
-    InternalError,
-    InputLocked,
-    InputDisabled,
-    /// The daemon has reached the 1000 active session limit.
-    SessionLimitReached,
-    /// The specified pane was not found.
-    PaneNotFound,
-    /// The specified client connection was not found / not attached (issue #146).
-    ClientNotFound,
 }

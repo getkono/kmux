@@ -9,7 +9,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+use kmux_protocol::messages::{
+    AuthFailure, ClientCapabilities, ClientMessage, ConnectionId, ServerMessage,
+};
 use kmux_sys::transport::EndpointAdvert;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -482,6 +484,29 @@ struct AuthOutcome {
     server_version: Option<String>,
 }
 
+/// A refused handshake: the daemon's words and, from a daemon that sends it,
+/// the typed reason.
+struct Refusal {
+    reason: String,
+    failure: Option<AuthFailure>,
+}
+
+impl Refusal {
+    /// The bootstrap error a refusal becomes. Decided on the typed reason:
+    /// the text is for people, and an older daemon's text is all it sent.
+    fn into_error(self) -> BootstrapError {
+        match self.failure {
+            Some(AuthFailure::ProtocolMismatch { client, daemon }) => {
+                BootstrapError::VersionMismatch {
+                    client: client.to_string(),
+                    server: daemon.to_string(),
+                }
+            }
+            _ => BootstrapError::Auth(self.reason),
+        }
+    }
+}
+
 /// Open the data-plane connection for `plan`, capturing `AuthResult`
 /// via an intercept task so it arrives at the caller's `server_tx` and
 /// is surfaced synchronously to `run_bootstrap`.
@@ -507,7 +532,7 @@ async fn establish(
     });
 
     let (intercept_tx, intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let (auth_tx, auth_rx) = oneshot::channel::<Result<AuthOutcome, String>>();
+    let (auth_tx, auth_rx) = oneshot::channel::<Result<AuthOutcome, Refusal>>();
 
     let sender_result = match plan.transport {
         TransportKind::Uds => {
@@ -625,8 +650,12 @@ async fn establish(
                     ServerMessage::AuthResult {
                         success: false,
                         reason,
+                        failure,
                         ..
-                    } => Err(reason.clone().unwrap_or_else(|| "rejected".into())),
+                    } => Err(Refusal {
+                        reason: kmux_protocol::messages::refusal_reason(reason.clone(), *failure),
+                        failure: *failure,
+                    }),
                     _ => unreachable!(),
                 };
                 if let Some(tx) = auth_tx.take() {
@@ -652,24 +681,16 @@ async fn establish(
             }
             Ok((client_tx, auth))
         }
-        Ok(Ok(Err(reason))) => {
+        Ok(Ok(Err(refusal))) => {
             observer.on_event(&BootstrapEvent::HandshakeAuthResult {
                 success: false,
                 connection_id: None,
                 server_version: None,
-                reason: Some(&reason),
+                reason: Some(&refusal.reason),
             });
-            // Detect server-side version mismatch (belt-and-suspenders: the
-            // pre-flight version gate in prepare_local_daemon should catch it
-            // first, but remote/direct transports go through this path only).
-            if reason.starts_with("protocol version mismatch:") {
-                Err(BootstrapError::VersionMismatch {
-                    client: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
-                    server: "unknown".to_string(),
-                })
-            } else {
-                Err(BootstrapError::Auth(reason))
-            }
+            // A version mismatch is caught first by the pre-flight gate in
+            // prepare_local_daemon; an SSH peer meets it only here.
+            Err(refusal.into_error())
         }
         // The link closed before the daemon answered — it went away mid
         // handshake (a crash, a restart). Not a refusal: a retry may well
@@ -708,6 +729,38 @@ mod tests {
             accept_invalid_certs: false,
         };
         assert_eq!(s.label(), "ssh alice@srv");
+    }
+
+    #[test]
+    fn a_refusal_is_classified_by_its_typed_failure() {
+        use kmux_protocol::messages::{PROTOCOL_RANGE, ProtocolRange, ProtocolVersion};
+        let newer = ProtocolRange::exact(ProtocolVersion::new(2, 0, 0));
+        let mismatch = Refusal {
+            reason: "whatever the daemon wrote".into(),
+            failure: Some(AuthFailure::ProtocolMismatch {
+                client: PROTOCOL_RANGE,
+                daemon: newer,
+            }),
+        };
+        match mismatch.into_error() {
+            BootstrapError::VersionMismatch { client, server } => {
+                assert_eq!(client, PROTOCOL_RANGE.to_string());
+                assert_eq!(server, "2.0.0");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        // Text alone never classifies: an older daemon's mismatch wording
+        // with no typed failure is an ordinary refusal.
+        for failure in [None, Some(AuthFailure::BadToken)] {
+            let refusal = Refusal {
+                reason: "protocol version mismatch: client=1.0.0, server=2.0.0".into(),
+                failure,
+            };
+            assert!(matches!(
+                refusal.into_error(),
+                BootstrapError::Auth(reason) if reason.starts_with("protocol version mismatch")
+            ));
+        }
     }
 
     #[test]

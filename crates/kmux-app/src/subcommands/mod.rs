@@ -126,7 +126,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, FrontendKind, ServerMessage, version_mismatch_hint,
+        AuthFailure, ClientCapabilities, ClientMessage, FrontendKind, ServerMessage, refusal_reason,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     use kmux_sys::identity::Identity;
@@ -164,14 +164,14 @@ where
             ServerMessage::AuthResult {
                 success: false,
                 reason,
+                failure,
                 ..
             } => {
-                let reason_str = reason.unwrap_or_else(|| "unknown error".into());
-                let hint = version_mismatch_hint(&reason_str);
-                if hint.is_empty() {
-                    anyhow::bail!("Authentication failed: {reason_str}");
+                let reason_str = refusal_reason(reason, failure);
+                match failure.as_ref().and_then(AuthFailure::hint) {
+                    Some(hint) => anyhow::bail!("Authentication failed: {reason_str}\n{hint}"),
+                    None => anyhow::bail!("Authentication failed: {reason_str}"),
                 }
-                anyhow::bail!("Authentication failed: {reason_str}\n{hint}");
             }
             _ => continue,
         }

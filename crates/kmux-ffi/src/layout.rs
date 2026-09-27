@@ -45,7 +45,8 @@ pub enum FfiProgressState {
 impl From<PaneProgressState> for FfiProgressState {
     fn from(s: PaneProgressState) -> Self {
         match s {
-            PaneProgressState::Remove => Self::Remove,
+            // A state from a newer daemon draws no bar.
+            PaneProgressState::Remove | PaneProgressState::Unknown => Self::Remove,
             PaneProgressState::Set => Self::Set,
             PaneProgressState::Error => Self::Error,
             PaneProgressState::Indeterminate => Self::Indeterminate,

@@ -92,10 +92,11 @@ pub(super) fn surface(
 
     let notif = gio::Notification::new(&title);
     notif.set_body(Some(&body));
-    // A blocked agent (NeedsInput) is more urgent than a completed turn.
+    // A blocked agent (NeedsInput) is more urgent than a completed turn, or
+    // than a reason from a newer daemon this build does not know.
     notif.set_priority(match kind {
         AttentionKind::NeedsInput => gio::NotificationPriority::Urgent,
-        AttentionKind::TurnDone => gio::NotificationPriority::Normal,
+        AttentionKind::TurnDone | AttentionKind::Unknown => gio::NotificationPriority::Normal,
     });
     let target = (word_id, pane_id).to_variant();
     notif.set_default_action_and_target_value(FULL_ACTION, Some(&target));

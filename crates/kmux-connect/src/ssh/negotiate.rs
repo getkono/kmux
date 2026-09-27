@@ -541,6 +541,7 @@ fn tail_stderr(raw: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kmux_protocol::messages::ProtocolVersion;
 
     // ── ProbeInfo deserialization ────────────────────────────────────────────
 
@@ -549,7 +550,10 @@ mod tests {
         let json = r#"{"quic_port":8443,"tcp_port":8444,"token":"abc","protocol_version":41,"protocol_range":{"min":{"major":1,"minor":0,"patch":0},"max":{"major":1,"minor":0,"patch":0}}}"#;
         let info: ProbeInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.protocol_version, Some(41));
-        assert_eq!(info.protocol_range, Some(PROTOCOL_RANGE));
+        assert_eq!(
+            info.protocol_range,
+            Some(ProtocolRange::exact(ProtocolVersion::new(1, 0, 0)))
+        );
         assert_eq!(info.tcp_port, 8444);
     }
 
@@ -656,9 +660,7 @@ mod tests {
             tcp_port: 2,
             token: "t".into(),
             protocol_version: Some(kmux_protocol::messages::LEGACY_PROTOCOL_VERSION),
-            protocol_range: Some(ProtocolRange::exact(
-                kmux_protocol::messages::ProtocolVersion::new(2, 0, 0),
-            )),
+            protocol_range: Some(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0))),
             kmuxd_version: None,
         };
         match enforce_version(&info, "user@host").unwrap_err() {

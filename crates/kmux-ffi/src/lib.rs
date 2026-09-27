@@ -244,6 +244,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_value_from_a_newer_daemon_maps_to_the_plain_one() {
+        // Every protocol value, the `Unknown` fallback included, maps without
+        // widening the FFI surface.
+        for (state, ffi) in [
+            (PaneProgressState::Remove, FfiProgressState::Remove),
+            (PaneProgressState::Set, FfiProgressState::Set),
+            (PaneProgressState::Error, FfiProgressState::Error),
+            (
+                PaneProgressState::Indeterminate,
+                FfiProgressState::Indeterminate,
+            ),
+            (PaneProgressState::Pause, FfiProgressState::Pause),
+            (PaneProgressState::Unknown, FfiProgressState::Remove),
+        ] {
+            assert_eq!(FfiProgressState::from(state), ffi, "{state:?}");
+        }
+        assert!(matches!(
+            FfiAttentionKind::from(AttentionKind::NeedsInput),
+            FfiAttentionKind::NeedsInput
+        ));
+        for kind in [AttentionKind::TurnDone, AttentionKind::Unknown] {
+            assert!(matches!(
+                FfiAttentionKind::from(kind),
+                FfiAttentionKind::TurnDone
+            ));
+        }
+    }
+
+    #[test]
     fn key_mods_map_to_proto_bits() {
         let none = FfiKeyMods {
             shift: false,

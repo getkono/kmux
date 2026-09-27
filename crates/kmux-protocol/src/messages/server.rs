@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use super::category::MessageCategory;
+use super::error::AuthFailure;
+use super::error::ErrorCode;
 use super::process::PaneProcesses;
 use super::session::{
-    ClientId, ClientInfo, ClosedSessionEntry, ConnectionId, DirEntry, ErrorCode, LayoutNode,
-    PaneId, PaneInfo, PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex,
-    TabInfo, WordId,
+    ClientId, ClientInfo, ClosedSessionEntry, ConnectionId, DirEntry, LayoutNode, PaneId, PaneInfo,
+    PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
 };
 use super::types::{Compression, ProtocolVersion};
 use super::vt::{CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff};
@@ -25,7 +26,13 @@ pub enum ServerMessage {
     /// Response to the `Auth` → `AuthChallenge` → `AuthProof` handshake.
     AuthResult {
         success: bool,
+        /// Why the handshake was refused, for a person to read; `None` on
+        /// success. Decide on `failure`, never on this text.
         reason: Option<String>,
+        /// Why the handshake was refused, typed; `None` on success. An older
+        /// daemon leaves it unset and sends only `reason`.
+        #[serde(default)]
+        failure: Option<AuthFailure>,
         /// Assigned on success; `None` on failure.
         client_id: Option<ClientId>,
         /// Server binary version (e.g. `"0.1.0"`); `None` on failure.
@@ -407,7 +414,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::session::{
-        ClientId, ErrorCode, PaneInfo, SessionEntry, SessionEventMsg, SessionMeta, TermSize,
+        ClientId, PaneInfo, SessionEntry, SessionEventMsg, SessionMeta, TermSize,
     };
     use super::super::vt::{CursorState, GridSnapshot, TermModes, TerminalDiff};
     use super::*;
@@ -674,6 +681,7 @@ mod tests {
                 ServerMessage::AuthResult {
                     success: true,
                     reason: None,
+                    failure: None,
                     client_id: None,
                     server_version: None,
                     connection_id: None,

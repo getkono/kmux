@@ -136,7 +136,16 @@ impl fmt::Display for ProtocolRange {
 }
 
 /// Newest schema version this build speaks (the top of [`PROTOCOL_RANGE`]).
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0, 0);
+///
+/// - `1.0.0` — the named-MessagePack baseline.
+/// - `1.1.0` — every nested enum that may grow (`ErrorCode`, `AuthFailure`,
+///   `SessionEventMsg`, …; the list is in
+///   `docs/architecture-protocol-versioning.md`) decodes a
+///   variant it does not know to its `Unknown` fallback instead of failing
+///   the frame, and a refused `AuthResult` carries a typed `failure`. So a
+///   sender may add a variant to one of those enums, without a capability,
+///   for a peer that negotiated `1.1.0` or later.
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1, 0);
 /// Oldest schema version this build still accepts from a peer.
 pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0, 0);
 /// The range advertised in `Auth` and matched against the peer's.
@@ -198,24 +207,17 @@ pub fn negotiate_capabilities(offered: &[String]) -> Vec<String> {
 /// The level used by the compressor is a sender-side choice and is intentionally
 /// not on the wire — the decompressor reconstructs it from the zstd frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(remote = "Self")]
 pub enum Compression {
     /// zstd (RFC 8878). The v1 default; see issue #59.
     Zstd,
+    /// An algorithm this build does not know, from a newer daemon. Only
+    /// observability reads this field, so nothing depends on it.
+    /// Sent only to relay a value received as `Unknown`.
+    #[serde(other)]
+    Unknown,
 }
-
-/// Parse a version-mismatch reason string and return an actionable upgrade
-/// hint, or an empty string if the reason is not a version mismatch.
-///
-/// Expected format: `"protocol version mismatch: client=X, server=Y"`.
-pub fn version_mismatch_hint(reason: &str) -> &'static str {
-    if reason.starts_with("protocol version mismatch:") {
-        "Hint: update kmux and kmuxd until their supported protocol ranges overlap."
-    } else if reason.starts_with("legacy protocol version:") {
-        "Hint: update the legacy kmux or kmuxd binary before connecting."
-    } else {
-        ""
-    }
-}
+super::wire_enum::wire_enum!(Compression);
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -287,19 +289,6 @@ mod tests {
         assert_eq!(TransportKind::parse_cli("auto"), None);
         assert_eq!(TransportKind::parse_cli("bogus"), None);
         assert_eq!(TransportKind::parse_cli(""), None);
-    }
-
-    #[test]
-    fn version_mismatch_hint_classifies_the_failure() {
-        let hint = version_mismatch_hint("protocol version mismatch: client=1.0.0, server=2.0.0");
-        assert!(hint.contains("ranges overlap"));
-        // A reason that is not a version mismatch yields no hint.
-        assert_eq!(version_mismatch_hint("connection refused"), "");
-        // Formatting details do not suppress the safe range-overlap guidance.
-        assert!(
-            version_mismatch_hint("protocol version mismatch: client=x, server=y")
-                .contains("ranges overlap")
-        );
     }
 
     #[test]

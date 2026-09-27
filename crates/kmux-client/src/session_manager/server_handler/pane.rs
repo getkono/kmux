@@ -114,11 +114,11 @@ impl SessionManager {
         Vec::new()
     }
 
-    /// Never sent: `kmuxd` constructs no `LayoutChanged`, and the
-    /// authoritative `LayoutUpdate` supersedes it. Kept as an arm rather
-    /// than a `..` catch-all so a new `SessionEventMsg` variant fails to
-    /// compile here instead of being silently dropped (docs/testing.md R4).
-    pub(super) fn on_event_layout_changed() -> Vec<SessionEvent> {
+    /// A `SessionEventMsg` from a newer daemon, which this build does not
+    /// know: ignored (`docs/architecture-protocol-versioning.md`, "Unknown
+    /// variants").
+    pub(super) fn on_event_unknown() -> Vec<SessionEvent> {
+        debug!("ignoring a session event this build does not know");
         Vec::new()
     }
 

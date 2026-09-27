@@ -13,6 +13,7 @@ mod pane_crud;
 /// (returning the no-op / "not supported" answer when the `federation` feature
 /// is off) so the dispatch layer never needs `#[cfg]` directives.
 mod peer_api;
+pub(crate) use peer_api::UNSUPPORTED_PEER_TARGET;
 mod persistence;
 mod recover;
 pub(super) mod restore;

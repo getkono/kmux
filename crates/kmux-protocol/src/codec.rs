@@ -532,6 +532,7 @@ mod tests {
         let msg = ServerMessage::AuthResult {
             success: true,
             reason: None,
+            failure: None,
             client_id: Some(ClientId(7)),
             server_version: Some("0.1.0".to_string()),
             connection_id: None,

@@ -340,8 +340,9 @@ impl ServerApp {
             .ok_or_else(|| KmuxError::SessionNotFound {
                 name: format!("{word_id} tab {tab_index}"),
             })?;
-        let leaves = tab.layout.leaves();
-        tab.layout = layout::apply_scheme(&leaves, scheme);
+        if let Some(tree) = layout::apply_scheme(&tab.layout.leaves(), scheme) {
+            tab.layout = tree;
+        }
         Ok((tab.layout.clone(), tab.focused_pane))
     }
 

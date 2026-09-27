@@ -1037,6 +1037,7 @@ mod tests {
         ServerMessage::AuthResult {
             success: true,
             reason: None,
+            failure: None,
             client_id: None,
             server_version: None,
             connection_id: None,
@@ -1090,6 +1091,7 @@ mod tests {
             .send(ServerMessage::AuthResult {
                 success: false,
                 reason: Some("bad token".into()),
+                failure: Some(kmux_protocol::messages::AuthFailure::BadToken),
                 client_id: None,
                 server_version: None,
                 connection_id: None,

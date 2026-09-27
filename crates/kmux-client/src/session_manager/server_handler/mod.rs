@@ -16,13 +16,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    AttentionKind, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, Compression,
-    ConnectionId, CursorState, DirEntry, GridSnapshot, LayoutNode, PaneId, PaneInfo, PaneProcesses,
-    PaneProgressState, PeerId, ProtocolVersion, RequestId, ScrollbackLine, SequenceNo,
-    ServerMessage, SessionEntry, SessionEventMsg, SessionStatus, TabIndex, TabInfo, TermModes,
-    TermSize, TerminalDiff, WordId, epoch_millis,
+    AttentionKind, AuthFailure, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry,
+    Compression, ConnectionId, CursorState, DirEntry, GridSnapshot, LayoutNode, PaneId, PaneInfo,
+    PaneProcesses, PaneProgressState, PeerId, ProtocolVersion, RequestId, ScrollbackLine,
+    SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, SessionStatus, TabIndex, TabInfo,
+    TermModes, TermSize, TerminalDiff, WordId, epoch_millis,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{DirListing, PaneSync, SessionManager};
 
@@ -197,6 +197,7 @@ impl SessionManager {
             ServerMessage::AuthResult {
                 success,
                 reason,
+                failure,
                 client_id,
                 server_version,
                 connection_id,
@@ -209,6 +210,7 @@ impl SessionManager {
             } => events.extend(self.on_auth_result(AuthOutcome {
                 success,
                 reason,
+                failure,
                 client_id,
                 server_version,
                 connection_id,
@@ -441,13 +443,12 @@ impl SessionManager {
                 event: SessionEventMsg::PaneFaulted { pane_id },
             } => events.extend(self.on_event_pane_faulted(pane_id)),
 
-            // Never sent: `kmuxd` constructs no `LayoutChanged`, and the
-            // authoritative `LayoutUpdate` supersedes it. Kept as an arm rather
-            // than a `..` catch-all so a new `SessionEventMsg` variant fails to
-            // compile here instead of being silently dropped (docs/testing.md R4).
+            // An event from a newer daemon. An arm rather than a `..`
+            // catch-all, so a variant this build adds fails to compile here
+            // instead of being silently dropped (docs/testing.md R4).
             ServerMessage::Event {
-                event: SessionEventMsg::LayoutChanged { .. },
-            } => events.extend(Self::on_event_layout_changed()),
+                event: SessionEventMsg::Unknown,
+            } => events.extend(Self::on_event_unknown()),
 
             ServerMessage::Lagged {
                 pane_id,
@@ -2621,18 +2622,15 @@ mod tests {
     }
 
     #[test]
-    fn a_layout_changed_event_is_the_only_ignored_broadcast() {
-        // `kmuxd` never constructs it; the authoritative `LayoutUpdate`
-        // supersedes it. Pinned so the arm is not mistaken for dead weight.
+    fn an_unknown_event_is_the_only_ignored_broadcast() {
+        // An event a newer daemon added decodes as `Unknown` (protocol 1.1)
+        // and changes nothing here.
         let (mut mgr, mut rx) = manager_on("eagle");
         drain(&mut rx);
         let before = observe(&mgr);
 
         let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::LayoutChanged {
-                word_id: "eagle".to_string(),
-                tab_index: 0,
-            },
+            event: SessionEventMsg::Unknown,
         });
 
         assert!(events.is_empty(), "no UI event: {events:?}");

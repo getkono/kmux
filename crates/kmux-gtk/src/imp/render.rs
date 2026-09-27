@@ -258,14 +258,15 @@ fn paint_pause_badge(cr: &cairo::Context, palette: &Palette, px: f64, py: f64, p
 }
 
 /// The `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `None`
-/// when no bar should be drawn (`Remove`). `Indeterminate` fills the full width;
+/// when no bar should be drawn (`Remove`, or a state from a newer daemon this
+/// build does not know). `Indeterminate` fills the full width;
 /// the numeric states use `progress`/100. Colours: set→accent, error→red,
 /// pause→orange.
 fn progress_bar_fill(info: &PaneInfo, palette: &Palette) -> Option<((u8, u8, u8), f64)> {
     use kmux_protocol::messages::PaneProgressState as S;
     let frac = f64::from(info.progress.unwrap_or(0).min(100)) / 100.0;
     let (c, fraction) = match info.progress_state {
-        S::Remove => return None,
+        S::Remove | S::Unknown => return None,
         S::Set => (palette.accent, frac),
         S::Error => (palette.red, frac),
         S::Pause => (palette.orange, frac),

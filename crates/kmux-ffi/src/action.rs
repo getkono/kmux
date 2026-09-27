@@ -44,7 +44,8 @@ pub enum FfiAttentionKind {
 impl From<AttentionKind> for FfiAttentionKind {
     fn from(k: AttentionKind) -> Self {
         match k {
-            AttentionKind::TurnDone => Self::TurnDone,
+            // A reason from a newer daemon is worded as the plain one.
+            AttentionKind::TurnDone | AttentionKind::Unknown => Self::TurnDone,
             AttentionKind::NeedsInput => Self::NeedsInput,
         }
     }

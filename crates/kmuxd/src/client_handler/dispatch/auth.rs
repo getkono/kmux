@@ -21,6 +21,7 @@ fn auth_failure(reason: String) -> ServerMessage {
     ServerMessage::AuthResult {
         success: false,
         reason: Some(reason),
+        failure: None,
         client_id: None,
         server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         connection_id: None,
@@ -209,6 +210,7 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
     state.send(ServerMessage::AuthResult {
         success: true,
         reason: None,
+        failure: None,
         client_id: Some(reg.client_id),
         server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         connection_id: Some(reg.connection_id),

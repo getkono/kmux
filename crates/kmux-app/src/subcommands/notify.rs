@@ -117,6 +117,8 @@ fn resolve_attention(
     let summary = match kind {
         AttentionKind::TurnDone => "finished a turn",
         AttentionKind::NeedsInput => "needs your input",
+        // Not reachable from the CLI's own flag; worded for completeness.
+        AttentionKind::Unknown => "wants your attention",
     };
 
     let title = title.unwrap_or_else(|| {

@@ -524,7 +524,7 @@ count = 12
 [[lints]]
 crate = "kmux-protocol"
 lint = "missing_docs"
-count = 483
+count = 472
 
 [[lints]]
 crate = "kmux-pty"

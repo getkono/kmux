@@ -1011,6 +1011,7 @@ mod tests {
         let events = mgr.handle_server_message(ServerMessage::AuthResult {
             success: true,
             reason: None,
+            failure: None,
             client_id: Some(ClientId(42)),
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
@@ -1026,6 +1027,14 @@ mod tests {
         assert_eq!(mgr.client_id, Some(ClientId(42)));
     }
 
+    /// The text a `Disconnected` state shows the user.
+    fn disconnect_text(mgr: &SessionManager) -> String {
+        match mgr.connection_state() {
+            super::ConnectionState::Disconnected { reason } => reason.to_string(),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
     #[test]
     fn auth_failed_emits_event_and_clears_connection() {
         use super::server_handler::SessionEvent;
@@ -1037,6 +1046,7 @@ mod tests {
         let events = mgr.handle_server_message(ServerMessage::AuthResult {
             success: false,
             reason: Some("bad token".to_string()),
+            failure: Some(kmux_protocol::messages::AuthFailure::BadToken),
             client_id: None,
             server_version: None,
             connection_id: None,
@@ -1053,6 +1063,43 @@ mod tests {
         ));
         assert!(!mgr.connected);
         assert!(mgr.ws_sender.is_none());
+    }
+
+    #[test]
+    fn a_protocol_mismatch_disconnects_with_the_upgrade_hint() {
+        use kmux_protocol::messages::{
+            AuthFailure, PROTOCOL_RANGE, ProtocolRange, ProtocolVersion,
+        };
+        let mut mgr = make_manager();
+        let failure = AuthFailure::ProtocolMismatch {
+            client: PROTOCOL_RANGE,
+            daemon: ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)),
+        };
+        let events = mgr.handle_server_message(ServerMessage::AuthResult {
+            success: false,
+            reason: Some(failure.to_string()),
+            failure: Some(failure),
+            client_id: None,
+            server_version: None,
+            connection_id: None,
+            compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
+        });
+        let shown = format!(
+            "{failure} | Hint: update kmux and kmuxd until their supported protocol ranges overlap."
+        );
+        assert_eq!(
+            disconnect_text(&mgr),
+            format!("auth failed: Auth failed: {shown}")
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [super::server_handler::SessionEvent::AuthFailed { reason }] if *reason == failure.to_string()
+        ));
     }
 
     #[test]

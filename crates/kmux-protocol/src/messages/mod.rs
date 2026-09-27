@@ -5,11 +5,14 @@ pub mod session;
 pub mod vt;
 
 mod client;
+mod error;
 mod server;
 mod types;
+pub(crate) mod wire_enum;
 
 pub use category::MessageCategory;
 pub use client::*;
+pub use error::*;
 pub use key::*;
 pub use process::*;
 pub use server::*;
