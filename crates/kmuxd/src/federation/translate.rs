@@ -109,6 +109,7 @@ pub(super) fn msg_pane_id(msg: &ServerMessage) -> Option<&str> {
         | TerminalSnapshot { pane_id, .. }
         | CursorUpdate { pane_id, .. }
         | ScrollbackAppend { pane_id, .. }
+        | GridDigest { pane_id, .. }
         | SyncReset { pane_id }
         | Lagged { pane_id, .. } => Some(pane_id.as_str()),
         _ => None,
@@ -123,6 +124,7 @@ pub(super) fn set_msg_pane_id(msg: &mut ServerMessage, new_id: String) {
         | TerminalSnapshot { pane_id, .. }
         | CursorUpdate { pane_id, .. }
         | ScrollbackAppend { pane_id, .. }
+        | GridDigest { pane_id, .. }
         | SyncReset { pane_id }
         | Lagged { pane_id, .. } => *pane_id = new_id,
         _ => warn!("set_msg_pane_id called on a message with no pane_id"),

@@ -155,6 +155,15 @@ fn on_reply_or_stream(
 /// that pane's viewers. `fan_out` applies the relay's backpressure policy: a
 /// full viewer is sent `Lagged` (out-of-band) and dropped, then resyncs on
 /// re-attach from the just-updated mirror.
+///
+/// Two frames are the hub's own business (issue #227). The peer's digest of
+/// its grid is checked against the mirror first: one that agrees is passed
+/// on to the viewers, which check their own grids against it; one that does
+/// not means the mirror is wrong, and the hub asks the peer for a snapshot
+/// instead, which resyncs the mirror and every viewer. A `Lagged` means the
+/// hub's own stream from the peer overflowed, so the mirror missed frames:
+/// the hub asks for a snapshot too, rather than send its viewers to a mirror
+/// that cannot serve them.
 fn on_pane_frame(conn: &Mutex<PeerConnection>, mut msg: ServerMessage) {
     let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) else {
         return;
@@ -164,9 +173,27 @@ fn on_pane_frame(conn: &Mutex<PeerConnection>, mut msg: ServerMessage) {
         return;
     };
     set_msg_pane_id(&mut msg, local_pane.clone());
-    if let Some(pane) = guard.panes.get_mut(&local_pane) {
-        pane.apply_to_mirror(&msg);
-        pane.fan_out(&local_pane, &msg);
+    let Some(pane) = guard.panes.get_mut(&local_pane) else {
+        return;
+    };
+    match &msg {
+        ServerMessage::GridDigest { seqno, hash, .. } => {
+            if pane.digest_matches(*seqno, *hash) {
+                pane.fan_out_digest(&msg);
+            } else {
+                debug!(
+                    pane = local_pane,
+                    ?seqno,
+                    "the mirror disagrees with the peer's digest"
+                );
+                guard.resync(&local_pane);
+            }
+        }
+        ServerMessage::Lagged { .. } => guard.resync(&local_pane),
+        _ => {
+            pane.apply_to_mirror(&msg);
+            pane.fan_out(&local_pane, &msg);
+        }
     }
 }
 
@@ -368,6 +395,51 @@ mod tests {
             matches!(&got, Some(ServerMessage::SyncReset { pane_id }) if *pane_id == "fedlocal/0"),
             "{got:?}"
         );
+    }
+
+    /// The peer's digest is checked against the hub's mirror (issue #227): one
+    /// that agrees reaches the viewer under the local pane id; one that does
+    /// not makes the hub ask the peer for a snapshot instead, and so does an
+    /// upstream `Lagged`, since the mirror then missed frames.
+    #[tokio::test(start_paused = true)]
+    async fn a_digest_is_relayed_or_a_wrong_mirror_resynced() {
+        let app = Arc::new(fixture_app());
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (mut data, _conn) = attach_viewer(&app);
+        let reattach = |m: &ClientMessage| match m {
+            ClientMessage::Attach {
+                pane_id,
+                last_seqno: None,
+                ..
+            } => Some(pane_id.clone()),
+            _ => None,
+        };
+        assert_eq!(next_upstream(&mut upstream, reattach).await, "fedremote/0");
+        let blank = kmux_client::grid::CellGrid::new(24, 80).live_digest();
+        let digest = |hash| ServerMessage::GridDigest {
+            pane_id: format_pane_id("fedremote", 0),
+            seqno: kmux_protocol::messages::SequenceNo(0),
+            hash,
+        };
+
+        peer.send(digest(blank)).unwrap();
+        let got = tokio::time::timeout(WAIT, data.recv())
+            .await
+            .expect("the digest within the bound");
+        assert!(
+            matches!(&got, Some(ServerMessage::GridDigest { pane_id, .. }) if pane_id == "fedlocal/0"),
+            "{got:?}"
+        );
+
+        peer.send(digest(blank ^ 1)).unwrap();
+        assert_eq!(next_upstream(&mut upstream, reattach).await, "fedremote/0");
+        peer.send(ServerMessage::Lagged {
+            pane_id: format_pane_id("fedremote", 0),
+            missed_count: 3,
+        })
+        .unwrap();
+        assert_eq!(next_upstream(&mut upstream, reattach).await, "fedremote/0");
+        assert!(data.try_recv().is_err(), "neither reaches the viewer");
     }
 
     /// The peer's events reach every client of the hub, as a local daemon's

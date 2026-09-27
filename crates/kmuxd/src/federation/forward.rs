@@ -8,9 +8,12 @@
 //! answer comes back through [`answer_routed`] (an answer with an id) or
 //! [`answer_unrequested`] (one without), rewritten to the sender's ids, to
 //! the sender alone. A request the hub cannot forward — the peer is down,
-//! the session is gone — is refused at once with a typed [`Refusal`]; one in
-//! flight when the link drops is answered by [`fail_in_flight`]. Nothing is
-//! dropped unanswered.
+//! the session is gone, another viewer holds the input lock — is refused at
+//! once with a typed [`Refusal`]; one in flight when the link drops is
+//! answered by [`fail_in_flight`]. Nothing is dropped unanswered.
+//!
+//! The *aggregated* input lock is here too: the hub arbitrates its own
+//! viewers and holds the peer's lock for the one holding its own.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -25,6 +28,17 @@ use super::translate::{localize_reply, reply_request_id, reply_word, set_reply_r
 use super::{PeerConnection, PeerManager, lock};
 use crate::app::Refusal;
 use crate::app::ServerApp;
+
+/// Whether `msg` is one of the three that write to a pane: the ones another
+/// viewer's input lock refuses.
+fn writes_input(msg: &ClientMessage) -> bool {
+    matches!(
+        msg,
+        ClientMessage::PtyInput { .. }
+            | ClientMessage::PtyKeyBatch { .. }
+            | ClientMessage::PtyPaste { .. }
+    )
+}
 
 /// Make `msg` fit to send on, or say it is not to be sent: the hub never
 /// sends `Unknown`. A newer client's attention kind is passed on as the one
@@ -66,12 +80,13 @@ impl PeerManager {
     /// Forward the request `msg` from `from` to the peer whose session it
     /// names, under the peer's ids and an id of the hub's own; the answer is
     /// routed back to `from` as it comes. Refused when the peer is unknown or
-    /// unreachable, or the session or pane is not (or no longer) one it
-    /// proxies.
+    /// unreachable, the session or pane is not (or no longer) one it proxies,
+    /// or — for input — another viewer holds the hub's input lock.
     pub fn forward(&self, from: Requester, mut msg: ClientMessage) -> Result<(), Refusal> {
         if !sendable(&mut msg) {
             return Ok(());
         }
+        let input = writes_input(&msg);
         let Federation::Forward { target, request_id } = msg.federation() else {
             return Err(Refusal {
                 request_id: None,
@@ -123,26 +138,8 @@ impl PeerManager {
                 "the peer is unreachable; its link is being re-opened".to_string(),
             ));
         }
-        match target {
-            Target::Session(word) => {
-                let Some(remote) = guard.local_to_remote.get(word.as_str()).cloned() else {
-                    return Err(refuse(
-                        ErrorCode::SessionNotFound,
-                        format!("session not found: {word}"),
-                    ));
-                };
-                *word = remote;
-            }
-            Target::Pane(pane) => {
-                let Some(remote) = guard.to_remote_pane(pane) else {
-                    return Err(refuse(
-                        ErrorCode::PaneNotFound,
-                        format!("pane not found: {pane}"),
-                    ));
-                };
-                *pane = remote;
-            }
-            Target::Peer(peer) => *peer = None,
+        if let Err((code, message)) = retarget(&guard, target, input.then_some(&from)) {
+            return Err(refuse(code, message));
         }
         if let Some(seq) = guard.routes.sent(&from) {
             let _ = guard.client_tx.send(ClientMessage::Ping { seq });
@@ -161,6 +158,66 @@ impl PeerManager {
             ));
         }
         Ok(())
+    }
+
+    /// `RequestInputLock` on the proxied pane `local_pane` from `from`: denied
+    /// here when another of this hub's clients holds its lock, else asked of
+    /// the peer, whose answer is routed back and, when granted, makes `from`
+    /// the holder here.
+    pub fn request_input_lock(&self, from: &Requester, local_pane: &str) -> Result<(), Refusal> {
+        let conn = self.pane_conn(local_pane)?;
+        let mut guard = lock(&conn);
+        if let Some(holder) = guard.input_locks.get(local_pane)
+            && let Some(holder_id) = holder.client_id()
+            && Some(holder_id) != from.client_id()
+        {
+            from.answer(ServerMessage::InputLockDenied {
+                pane_id: local_pane.to_string(),
+                holder: holder_id,
+            });
+            return Ok(());
+        }
+        let remote_pane = upstream_pane(&guard, local_pane)?;
+        guard.send(
+            from,
+            ClientMessage::RequestInputLock {
+                pane_id: remote_pane,
+            },
+        );
+        Ok(())
+    }
+
+    /// `ReleaseInputLock` on the proxied pane `local_pane` from `from`:
+    /// passed to the peer when `from` holds the lock, whose answer releases it
+    /// here too; answered with nothing otherwise, as a local release is.
+    pub fn release_input_lock(&self, from: &Requester, local_pane: &str) -> Result<(), Refusal> {
+        let conn = self.pane_conn(local_pane)?;
+        let mut guard = lock(&conn);
+        let holds = guard
+            .input_locks
+            .get(local_pane)
+            .is_some_and(|holder| holder.client_id() == from.client_id());
+        if holds {
+            let remote_pane = upstream_pane(&guard, local_pane)?;
+            guard.send(
+                from,
+                ClientMessage::ReleaseInputLock {
+                    pane_id: remote_pane,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// The link of the proxied pane `local_pane`, refused when there is none.
+    fn pane_conn(&self, local_pane: &str) -> Result<Arc<Mutex<PeerConnection>>, Refusal> {
+        parse_pane_id(local_pane)
+            .and_then(|(word, _)| self.conn_for_word(word))
+            .ok_or_else(|| Refusal {
+                request_id: None,
+                code: ErrorCode::PaneNotFound,
+                message: format!("pane not found: {local_pane}"),
+            })
     }
 
     /// Register the session the peer created (or restored) for a forwarded
@@ -204,6 +261,54 @@ impl PeerManager {
             .insert(local_word, peer_id.to_string());
         entry
     }
+}
+
+/// Rewrite `target` to the peer's ids, or say why it cannot be: the session
+/// or pane is no longer one the link proxies, or — for input from `writer` —
+/// another client holds the hub's input lock on the pane.
+fn retarget(
+    guard: &PeerConnection,
+    target: Target<'_>,
+    writer: Option<&Requester>,
+) -> Result<(), (ErrorCode, String)> {
+    match target {
+        Target::Session(word) => {
+            let Some(remote) = guard.local_to_remote.get(word.as_str()).cloned() else {
+                return Err((
+                    ErrorCode::SessionNotFound,
+                    format!("session not found: {word}"),
+                ));
+            };
+            *word = remote;
+        }
+        Target::Pane(pane) => {
+            if let Some(writer) = writer
+                && let Some(holder) = guard.input_locks.get(pane.as_str())
+                && holder.client_id() != writer.client_id()
+            {
+                return Err((
+                    ErrorCode::InputLocked,
+                    format!("pane {pane} is locked by another client"),
+                ));
+            }
+            let Some(remote) = guard.to_remote_pane(pane) else {
+                return Err((ErrorCode::PaneNotFound, format!("pane not found: {pane}")));
+            };
+            *pane = remote;
+        }
+        Target::Peer(peer) => *peer = None,
+    }
+    Ok(())
+}
+
+/// The peer's id for the proxied pane `local_pane`, refused when its session
+/// is gone.
+fn upstream_pane(guard: &PeerConnection, local_pane: &str) -> Result<String, Refusal> {
+    guard.to_remote_pane(local_pane).ok_or_else(|| Refusal {
+        request_id: None,
+        code: ErrorCode::PaneNotFound,
+        message: format!("pane not found: {local_pane}"),
+    })
 }
 
 /// Answer the forwarded request `msg` answers, if one is waiting — `None`
@@ -252,9 +357,10 @@ pub(super) fn answer_routed(
 }
 
 /// Answer the sender of the request `msg` answers when it is one of the
-/// answers that carry no `request_id` — an `Error` or `SessionRenamed` — or
-/// hand `msg` back. It is the oldest run's (see [`super::routes`]); the hub's
-/// own requests' answers go nowhere.
+/// answers that carry no `request_id` — an `Error`, `SessionRenamed`, or an
+/// input-lock reply — or hand `msg` back. It is the oldest run's (see
+/// [`super::routes`]). A lock granted or released moves the hub's lock with
+/// it; the hub's own requests' answers go nowhere.
 pub(super) fn answer_unrequested(
     conn: &Mutex<PeerConnection>,
     mut msg: ServerMessage,
@@ -265,11 +371,14 @@ pub(super) fn answer_unrequested(
             request_id: None,
             ..
         } | ServerMessage::SessionRenamed { .. }
+            | ServerMessage::InputLockGranted { .. }
+            | ServerMessage::InputLockDenied { .. }
+            | ServerMessage::InputLockReleased { .. }
     );
     if !unrequested {
         return Some(msg);
     }
-    let guard = lock(conn);
+    let mut guard = lock(conn);
     let Some(from) = guard.routes.front().cloned() else {
         debug!(?msg, "an answer from the peer with no request waiting");
         return None;
@@ -277,13 +386,28 @@ pub(super) fn answer_unrequested(
     if let Some(local_word) = reply_word(&msg).and_then(|w| guard.remote_to_local.get(w).cloned()) {
         localize_reply(&mut msg, &local_word);
     }
+    match &msg {
+        ServerMessage::InputLockGranted { pane_id } => {
+            guard.input_locks.insert(pane_id.clone(), from.clone());
+        }
+        ServerMessage::InputLockReleased { pane_id }
+            if guard
+                .input_locks
+                .get(pane_id)
+                .is_some_and(|holder| holder.client_id() == from.client_id()) =>
+        {
+            guard.input_locks.remove(pane_id);
+        }
+        _ => {}
+    }
     drop(guard);
     from.answer(msg);
     None
 }
 
 /// The link dropped: answer every request still waiting with an `Error`,
-/// since its answer will never come.
+/// since its answer will never come, and tell every lock holder its lock is
+/// gone (a new link holds none).
 pub(super) fn fail_in_flight(conn: &mut PeerConnection) {
     for route in conn.routes.drain() {
         route.from.answer(ServerMessage::Error {
@@ -291,6 +415,9 @@ pub(super) fn fail_in_flight(conn: &mut PeerConnection) {
             code: ErrorCode::InternalError,
             message: "the peer became unreachable before it answered".to_string(),
         });
+    }
+    for (pane_id, holder) in conn.input_locks.drain() {
+        holder.answer(ServerMessage::InputLockReleased { pane_id });
     }
 }
 
@@ -751,34 +878,122 @@ mod tests {
         assert_eq!(entry.peer.as_deref(), Some("peer:1"));
     }
 
-    /// A link that drops answers everything still waiting with an error: the
-    /// answers will never come.
+    /// The hub arbitrates the input lock between its own clients and holds
+    /// the peer's for the one holding its own; the others' input is refused
+    /// (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn the_hub_arbitrates_the_input_lock_between_its_clients() {
+        let mut hub = fixture_hub();
+        let (a, mut a_answers) = client(1);
+        let (b, mut b_answers) = client(2);
+        let mgr = &hub.app.peer_manager;
+        let pane = "fedlocal/0";
+
+        mgr.request_input_lock(&a, pane).unwrap();
+        assert!(matches!(
+            next_request(&mut hub.upstream).await,
+            ClientMessage::RequestInputLock { pane_id } if pane_id == "fedremote/0"
+        ));
+        hub.peer
+            .send(ServerMessage::InputLockGranted {
+                pane_id: "fedremote/0".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockGranted { pane_id } if pane_id == pane
+        ));
+
+        // B is denied here, naming A, without asking the peer.
+        mgr.request_input_lock(&b, pane).unwrap();
+        assert!(matches!(
+            answer(&mut b_answers).await,
+            ServerMessage::InputLockDenied {
+                holder: ClientId(1),
+                ..
+            }
+        ));
+        let input = |from: &Requester| {
+            mgr.forward(
+                from.clone(),
+                ClientMessage::PtyInput {
+                    pane_id: pane.into(),
+                    data: b"x".to_vec(),
+                },
+            )
+        };
+        assert_eq!(input(&b).unwrap_err().code, ErrorCode::InputLocked);
+        input(&a).expect("the holder types");
+        assert!(matches!(
+            next_request(&mut hub.upstream).await,
+            ClientMessage::PtyInput { .. }
+        ));
+
+        // Only the holder's release goes up; the peer's answer frees it here.
+        mgr.release_input_lock(&b, pane).unwrap();
+        mgr.release_input_lock(&a, pane).unwrap();
+        assert!(matches!(
+            next_request(&mut hub.upstream).await,
+            ClientMessage::ReleaseInputLock { pane_id } if pane_id == "fedremote/0"
+        ));
+        hub.peer
+            .send(ServerMessage::InputLockReleased {
+                pane_id: "fedremote/0".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockReleased { .. }
+        ));
+        input(&b).expect("unlocked again");
+        assert!(b_answers.try_recv().is_err());
+        assert_eq!(
+            mgr.request_input_lock(&a, "nosuch/0").unwrap_err().code,
+            ErrorCode::PaneNotFound
+        );
+    }
+
+    /// A link that drops answers everything still waiting with an error, and
+    /// tells a lock holder its lock is gone: the answers will never come.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_link_answers_what_was_in_flight() {
         let mut hub = fixture_hub();
         let (a, mut answers) = client(1);
-        hub.app
-            .peer_manager
-            .forward(
-                a,
-                ClientMessage::FetchHistory {
-                    request_id: 30,
-                    pane_id: "fedlocal/0".into(),
-                    start_index: 0,
-                    count: 1,
-                },
-            )
+        let mgr = &hub.app.peer_manager;
+        mgr.request_input_lock(&a, "fedlocal/0").unwrap();
+        next_request(&mut hub.upstream).await;
+        hub.peer
+            .send(ServerMessage::InputLockGranted {
+                pane_id: "fedremote/0".into(),
+            })
             .unwrap();
+        answer(&mut answers).await;
+        mgr.forward(
+            a,
+            ClientMessage::FetchHistory {
+                request_id: 30,
+                pane_id: "fedlocal/0".into(),
+                start_index: 0,
+                count: 1,
+            },
+        )
+        .unwrap();
         next_request(&mut hub.upstream).await;
         drop(hub.peer);
 
+        let mut got = [answer(&mut answers).await, answer(&mut answers).await];
+        got.sort_by_key(|m| format!("{m:?}"));
         assert!(matches!(
-            answer(&mut answers).await,
+            &got[0],
             ServerMessage::Error {
                 request_id: Some(30),
                 code: ErrorCode::InternalError,
                 ..
             }
+        ));
+        assert!(matches!(
+            &got[1],
+            ServerMessage::InputLockReleased { pane_id } if pane_id == "fedlocal/0"
         ));
     }
 }

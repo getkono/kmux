@@ -3,7 +3,7 @@
 
 use kmux_protocol::messages::{ClientId, KeyEvent, PaneId, ServerMessage, TermSize};
 
-use crate::app::InputLockOutcome;
+use crate::app::{InputLockOutcome, Requester};
 use crate::connection::classify_error;
 
 use super::super::SharedClientState;
@@ -78,6 +78,13 @@ pub(super) async fn on_request_input_lock(
     client_id: ClientId,
     pane_id: PaneId,
 ) {
+    if state.app.is_federated_pane(&pane_id) {
+        let from = Requester::client(client_id, state.ctrl_tx.clone());
+        if let Err(refusal) = state.app.federated_request_input_lock(&from, &pane_id) {
+            state.send(refusal.into_error());
+        }
+        return;
+    }
     match state.app.request_input_lock(&pane_id, client_id).await {
         Ok(InputLockOutcome::Granted) => {
             state.send(ServerMessage::InputLockGranted { pane_id });
@@ -95,6 +102,13 @@ pub(super) async fn on_release_input_lock(
     client_id: ClientId,
     pane_id: PaneId,
 ) {
+    if state.app.is_federated_pane(&pane_id) {
+        let from = Requester::client(client_id, state.ctrl_tx.clone());
+        if let Err(refusal) = state.app.federated_release_input_lock(&from, &pane_id) {
+            state.send(refusal.into_error());
+        }
+        return;
+    }
     match state.app.release_input_lock(&pane_id, client_id).await {
         Ok(true) => state.send(ServerMessage::InputLockReleased { pane_id }),
         Ok(false) => {}
@@ -215,5 +229,41 @@ mod tests {
         assert_eq!(request_id, None);
         assert_eq!(code, ErrorCode::PaneNotFound);
         assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    /// A proxied pane's input lock is the hub's to arbitrate (issue #227):
+    /// the request goes to the peer, the grant makes this client the holder,
+    /// and the holder's release goes to the peer too.
+    #[cfg(feature = "federation")]
+    #[tokio::test(start_paused = true)]
+    async fn a_proxied_panes_input_lock_is_taken_and_released_through_the_peer() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let (mut upstream, peer) = state.app.install_channel_peer("fedlocal", "fedremote");
+        let pane_id = || "fedlocal/0".to_string();
+
+        let request = ClientMessage::RequestInputLock { pane_id: pane_id() };
+        assert!(handle_message(&mut state, request, &NoopAttacher).await);
+        assert!(matches!(
+            upstream.try_recv(),
+            Ok(ClientMessage::RequestInputLock { pane_id }) if pane_id == "fedremote/0"
+        ));
+        peer.send(ServerMessage::InputLockGranted {
+            pane_id: "fedremote/0".to_string(),
+        })
+        .unwrap();
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(60), ctrl_rx.recv())
+            .await
+            .expect("the grant within the bound");
+        assert!(matches!(
+            granted,
+            Some(ServerMessage::InputLockGranted { pane_id }) if pane_id == "fedlocal/0"
+        ));
+
+        let release = ClientMessage::ReleaseInputLock { pane_id: pane_id() };
+        assert!(handle_message(&mut state, release, &NoopAttacher).await);
+        assert!(matches!(
+            upstream.try_recv(),
+            Ok(ClientMessage::ReleaseInputLock { pane_id }) if pane_id == "fedremote/0"
+        ));
     }
 }
