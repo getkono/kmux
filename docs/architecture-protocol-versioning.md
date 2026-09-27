@@ -6,34 +6,19 @@ MessagePack schema, a semantic supported-version range, and explicit named
 capabilities. Authentication negotiates both before either side sends normal
 session traffic.
 
-This contract applies only to `ClientMessage` and `ServerMessage`. Persistence,
+This document is how the schema *changes*; what it *is* is specified in
+[protocol.md](protocol.md). This contract applies only to `ClientMessage` and
+`ServerMessage`. Persistence,
 daemon handoff, the daemon↔VT-worker protocol, and C/Swift ABIs keep their own
 formats and version gates.
 
 ## Wire format
 
-Every transport uses the same frame envelope:
-
-```text
-[u32 big-endian length][u8 codec tag][payload…]
-```
-
-The payload is MessagePack encoded with named struct fields. The top-level
-message enums use Serde's adjacent representation: a `type` field names the
-variant and a `data` field contains its payload. This avoids positional coupling
-between struct fields and makes additive evolution possible.
-
-Codec tags are permanent assignments:
-
-| Tag | Meaning |
-|---:|---|
-| `0` | Legacy raw Postcard; rejected with an upgrade error |
-| `1` | Legacy zstd-compressed Postcard; rejected with an upgrade error |
-| `2` | Raw named MessagePack |
-| `3` | zstd-compressed named MessagePack |
-
-Tags `0` and `1` are never reused. A new decoder therefore cannot mistake an
-old positional payload for a current named payload.
+Every transport carries the same frames — a length prefix, a codec tag and a
+named-MessagePack payload — specified in [protocol.md](protocol.md#frames),
+with the message catalogue, state machines and error model. Codec tags are
+permanent assignments: the retired Postcard tags `0` and `1` are never reused,
+so a new decoder cannot mistake an old positional payload for a named one.
 
 ## Version and capability negotiation
 

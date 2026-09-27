@@ -110,7 +110,9 @@ These are strictly-typed config/CLI, not environment variables.
 
 - Every component that talks to an external dependency is versioned and rejects
   incompatible peers: the data protocol (`PROTOCOL_RANGE` plus named
-  capabilities), the `kmux-ffi` C ABI
+  capabilities; specified, message by message, in
+  [docs/protocol.md](docs/protocol.md), which its `spec` tests hold to the
+  code — change the two together), the `kmux-ffi` C ABI
   (`KMUX_FFI_ABI_VERSION`), the daemon↔worker contract (`kmux-worker-protocol`),
   and `kmux-ghostty-sys` (`EXPECTED_ABI_VERSION`).
 - Every connecting party proves a cryptographic identity (issue #146): the daemon

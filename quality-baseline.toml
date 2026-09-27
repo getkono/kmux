@@ -239,7 +239,7 @@ count = 17
 [[lints]]
 crate = "kmux-client"
 lint = "missing_docs"
-count = 309
+count = 307
 
 [[lints]]
 crate = "kmux-connect"
