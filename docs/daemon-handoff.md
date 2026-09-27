@@ -122,20 +122,28 @@ by stopping the successor itself rather than trusting it to stand down:
 ## Correctness invariants
 
 - **No split reads.** O streams the fds while it is still the sole reader, then
-  parks every in-process relay between two reads (`hold_relays`, a hold that
-  can be released) and only then snapshots. After the commit point it aborts
-  the parked relays (`quiesce_relays`). N starts reading strictly later (after
-  `Released`). Output produced in the gap stays buffered in the kernel PTY and is
-  drained by N. So no two readers ever race on a master, and no bytes are lost.
+  parks every pane's reader between two reads (`hold_relays`, a hold that can be
+  released) and only then snapshots: an in-process pane's relay loop, and a
+  worker pane's `kmux-vt-worker`, which parks on `WorkerRequest::Hold` and
+  answers `Held` after every event for what it read, so the daemon-side mirror
+  the checkpoint is taken from is complete. After the commit point it stops the
+  parked readers (`quiesce_relays`: the relay tasks are aborted, the workers
+  shut down). N starts reading strictly later (after `Released`). Output
+  produced in the gap stays buffered in the kernel PTY and is drained by N. So
+  no two readers ever race on a master, and no bytes are lost. A worker respawn
+  waits for the handoff to end, so no fresh, unheld reader appears meanwhile.
 - **Checkpoint before the commit point.** The final checkpoint is written,
   `fsync`ed and sealed (`Checkpointer::write_final_from`) before `Complete` is sent,
   so nothing fallible remains after N's `Ack` (issue #207). It used to be written
   after the `Ack`, and a failed write there was treated as a rollback although N
   already held every fd. The snapshot N seeds from reflects exactly the bytes O
   consumed; everything after sits unread in the kernel buffer for N.
-- **Worker panes are not held.** A `kmux-vt-worker` reads its PTY itself, so it
-  runs on until the commit point, when `quiesce_relays` shuts it down; the output
-  it consumed after the checkpoint is not in N's seed (as before).
+- **Worker panes are held too** (issue #207). They used not to be: a
+  `kmux-vt-worker` read its PTY on until the commit point, so what it consumed
+  after the checkpoint was in neither N's seed nor N's kernel buffer. A worker
+  blocked writing input to a child that does not read stdin cannot read the
+  `Hold` until that write is done, so it fails the hold (`HOLD`, 5 s) and the
+  handoff rolls back rather than splitting a read.
 - **Foreign-child exit.** N's inherited children are reparented to init and
   cannot be `waitpid`-ed, so exit is surfaced by the relay loop's PTY-EOF break
   (`session_diff_loop` → `SessionManager::notify_exited` → `PaneExited`), backed

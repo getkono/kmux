@@ -45,6 +45,14 @@ impl ServerApp {
             .map_err(|_| KmuxError::HandoffInProgress)
     }
 
+    /// Wait until no handoff runs, for work that must not happen during one
+    /// — respawning a worker, whose new reader a handoff could not have
+    /// frozen. `None` once a handoff has committed: this daemon is exiting.
+    pub(super) async fn wait_for_pane_admission(&self) -> Option<PaneCreationAdmitted> {
+        let admitted = PaneCreationAdmitted(Arc::clone(&self.pane_gate).read_owned().await);
+        (!self.pane_creation_ended.load(Ordering::SeqCst)).then_some(admitted)
+    }
+
     /// Close pane creation for a handoff, once the creations already under
     /// way have finished (their panes are then advertised).
     pub async fn close_pane_creation(&self) -> PaneCreationClosed {
@@ -93,23 +101,26 @@ impl ServerApp {
         out
     }
 
-    /// Park every in-process pane's PTY reader between two reads, for a
-    /// handoff's final checkpoint (issue #207): once this returns `true`, the
-    /// checkpoint holds exactly the output this daemon consumed. Unlike
+    /// Park every pane's PTY reader between two reads, for a handoff's final
+    /// checkpoint (issue #207): once this returns `true`, the checkpoint holds
+    /// exactly the output this daemon consumed. An in-process pane's relay
+    /// loop parks; a worker pane's worker parks and says so after every event
+    /// for what it read, so the mirror the checkpoint reads is complete. Unlike
     /// [`Self::quiesce_relays`] it can be undone, by
     /// [`Self::release_relays`], so a handoff that fails afterwards rolls back
     /// to panes that read again.
     ///
     /// Returns `false`, with every reader released again, when one has not
-    /// parked within `timeout`. Worker panes are not held: their worker reads
-    /// the PTY itself.
+    /// parked within `timeout` — a worker blocked writing input to a child
+    /// that does not read its stdin reads no request until that write is done,
+    /// the hold included, and so fails the handoff rather than delays it.
     pub async fn hold_relays(&self, timeout: Duration) -> bool {
         let holds: Vec<_> = {
             let sessions = self.sessions.read().await;
             sessions
                 .values()
                 .flat_map(|state| state.panes.values())
-                .filter_map(|relay| relay.engine.hold_reader())
+                .map(|relay| relay.engine.hold_reader())
                 .collect()
         };
         let deadline = tokio::time::Instant::now() + timeout;
