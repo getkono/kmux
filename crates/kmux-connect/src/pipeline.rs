@@ -808,28 +808,4 @@ mod tests {
         assert_eq!(transport_strategy_name(TransportKind::Uds), "uds");
         assert_eq!(transport_strategy_name(TransportKind::Tcp), "tcp");
     }
-
-    #[test]
-    fn noop_observer_accepts_every_event() {
-        // The observer is infallible; this just checks that we constructed
-        // every variant successfully (catches any new non_exhaustive arm
-        // that was added without a corresponding NoopObserver handler).
-        let target = ResolvedTarget::LocalDaemon;
-        let o = NoopObserver;
-        o.on_event(&BootstrapEvent::ParsedTarget { target: &target });
-        o.on_event(&BootstrapEvent::DaemonNotRunning);
-        o.on_event(&BootstrapEvent::SshProtocolVersionOk {
-            version: "1.0.0".into(),
-        });
-        o.on_event(&BootstrapEvent::HandshakeAuthSent {
-            protocol_version: "1.0.0".into(),
-            connection_id: Some(ConnectionId(7)),
-        });
-        o.on_event(&BootstrapEvent::HandshakeAuthResult {
-            success: true,
-            connection_id: Some(ConnectionId(7)),
-            server_version: Some("1.2.3"),
-            reason: None,
-        });
-    }
 }

@@ -243,18 +243,29 @@ pub fn parse_remote_target(server: &str) -> Option<RemoteTarget> {
 /// If none of those produces a value the field is left `None` and `ssh` will
 /// fall through to its own defaults (`~/.ssh/config`, then OS user).
 pub fn resolve_remote_target(parsed: &ParsedServer) -> Option<RemoteTarget> {
+    let entry = HostsConfig::load()
+        .get(&parsed.host)
+        .cloned()
+        .unwrap_or_default();
+    resolve_with(parsed, entry, std::env::var("USER").ok())
+}
+
+/// [`resolve_remote_target`] with its inputs explicit: the `hosts.toml` entry
+/// for the host (default if none) and the `$USER` value.
+fn resolve_with(
+    parsed: &ParsedServer,
+    entry: HostEntry,
+    env_user: Option<String>,
+) -> Option<RemoteTarget> {
     if parsed.host.is_empty() {
         return None;
     }
 
-    let config = HostsConfig::load();
-    let entry = config.get(&parsed.host).cloned().unwrap_or_default();
-
     let user = parsed
         .user
         .clone()
-        .or_else(|| entry.user.clone())
-        .or_else(|| std::env::var("USER").ok().filter(|s| !s.is_empty()));
+        .or(entry.user)
+        .or_else(|| env_user.filter(|s| !s.is_empty()));
 
     Some(RemoteTarget {
         user,
@@ -287,137 +298,111 @@ fn apply_entry(target: &mut RemoteTarget, entry: &HostEntry) {
 mod tests {
     use super::*;
 
-    // ── parse_server_string tests ────────────────────────────────────────────
-
     #[test]
-    fn parse_user_at_host() {
-        assert_eq!(
-            parse_server_string("alice@example.com"),
-            ParsedServer {
-                user: Some("alice".into()),
-                host: "example.com".into(),
-                port: None,
-                path: None,
-            }
-        );
+    fn parse_server_string_splits_every_form() {
+        let parsed =
+            |user: Option<&str>, host: &str, port: Option<u16>, path: Option<&str>| ParsedServer {
+                user: user.map(Into::into),
+                host: host.into(),
+                port,
+                path: path.map(Into::into),
+            };
+        let alice = Some("alice");
+        let bob = Some("bob");
+        let cases = [
+            (
+                "alice@example.com",
+                parsed(alice, "example.com", None, None),
+            ),
+            (
+                "alice@example.com:/home/alice/project",
+                parsed(alice, "example.com", None, Some("/home/alice/project")),
+            ),
+            (
+                "alice@example.com:2222",
+                parsed(alice, "example.com", Some(2222), None),
+            ),
+            (
+                "192.168.1.1:7777",
+                parsed(None, "192.168.1.1", Some(7777), None),
+            ),
+            ("devbox", parsed(None, "devbox", None, None)),
+            ("bob@server:/", parsed(bob, "server", None, Some("/"))),
+            (
+                "bob@server:/home/bob/my project",
+                parsed(bob, "server", None, Some("/home/bob/my project")),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_server_string(input), expected, "input {input:?}");
+        }
+    }
+
+    /// The user comes from `user@`, then the `hosts.toml` entry, then `$USER`;
+    /// a port in the server string is always the SSH port.
+    #[test]
+    fn resolve_with_takes_user_host_and_port_in_precedence_order() {
+        let alias = HostEntry {
+            hostname: Some("prod.example.com".into()),
+            user: Some("deploy".into()),
+            ssh_port: Some(2200),
+        };
+        let none = HostEntry::default;
+        let cases = [
+            (
+                "alice@example.com",
+                none(),
+                (Some("alice"), "example.com", None),
+            ),
+            (
+                "alice@example.com:/home/alice",
+                none(),
+                (Some("alice"), "example.com", None),
+            ),
+            (
+                "alice@example.com:2222",
+                none(),
+                (Some("alice"), "example.com", Some(2222)),
+            ),
+            (
+                "192.168.1.1:7777",
+                none(),
+                (Some("me"), "192.168.1.1", Some(7777)),
+            ),
+            ("focalors", none(), (Some("me"), "focalors", None)),
+            (
+                "prod",
+                alias.clone(),
+                (Some("deploy"), "prod.example.com", Some(2200)),
+            ),
+            (
+                "alice@prod:22",
+                alias,
+                (Some("alice"), "prod.example.com", Some(22)),
+            ),
+        ];
+        for (input, entry, (user, host, ssh_port)) in cases {
+            let t = resolve_with(&parse_server_string(input), entry, Some("me".into()))
+                .unwrap_or_else(|| panic!("{input:?} resolves"));
+            assert_eq!(
+                (t.user.as_deref(), t.host.as_str(), t.ssh_port),
+                (user, host, ssh_port),
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn parse_user_at_host_with_path() {
-        assert_eq!(
-            parse_server_string("alice@example.com:/home/alice/project"),
-            ParsedServer {
-                user: Some("alice".into()),
-                host: "example.com".into(),
-                port: None,
-                path: Some("/home/alice/project".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_user_at_host_with_port() {
-        assert_eq!(
-            parse_server_string("alice@example.com:2222"),
-            ParsedServer {
-                user: Some("alice".into()),
-                host: "example.com".into(),
-                port: Some(2222),
-                path: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_host_colon_port() {
-        assert_eq!(
-            parse_server_string("192.168.1.1:7777"),
-            ParsedServer {
-                host: "192.168.1.1".into(),
-                port: Some(7777),
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_bare_alias() {
-        assert_eq!(
-            parse_server_string("devbox"),
-            ParsedServer {
-                host: "devbox".into(),
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_root_path() {
-        assert_eq!(
-            parse_server_string("bob@server:/"),
-            ParsedServer {
-                user: Some("bob".into()),
-                host: "server".into(),
-                port: None,
-                path: Some("/".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_path_with_spaces_and_special_chars() {
-        assert_eq!(
-            parse_server_string("bob@server:/home/bob/my project"),
-            ParsedServer {
-                user: Some("bob".into()),
-                host: "server".into(),
-                port: None,
-                path: Some("/home/bob/my project".into()),
-            }
-        );
-    }
-
-    // ── parse_remote_target tests ────────────────────────────────────────────
-
-    #[test]
-    fn parse_remote_target_user_at_host() {
-        let t = parse_remote_target("alice@example.com").unwrap();
-        assert_eq!(t.user.as_deref(), Some("alice"));
-        assert_eq!(t.host, "example.com");
-        assert!(t.ssh_port.is_none());
-    }
-
-    #[test]
-    fn parse_remote_target_host_colon_port_is_ssh_port() {
-        // No '@' — falls back to $USER (or ssh defaults if USER is unset).
-        // The colon-port is interpreted as the SSH port, not a data-plane port.
-        let t = parse_remote_target("192.168.1.1:7777").unwrap();
-        assert_eq!(t.host, "192.168.1.1");
-        assert_eq!(t.ssh_port, Some(7777));
-    }
-
-    #[test]
-    fn parse_remote_target_bare_host_uses_default_user() {
-        let t = parse_remote_target("focalors").unwrap();
-        assert_eq!(t.host, "focalors");
-        assert!(t.ssh_port.is_none());
-        // Either $USER was set (Some), or ssh will use its own defaults (None);
-        // both are acceptable. The point is it resolves to an SSH target.
-    }
-
-    #[test]
-    fn parse_remote_target_user_at_host_with_path() {
-        // user@host:/path should still resolve to an SSH target
-        let t = parse_remote_target("alice@example.com:/home/alice").unwrap();
-        assert_eq!(t.user.as_deref(), Some("alice"));
-        assert_eq!(t.host, "example.com");
-    }
-
-    #[test]
-    fn parse_remote_target_user_at_host_with_port() {
-        let t = parse_remote_target("alice@example.com:2222").unwrap();
-        assert_eq!(t.user.as_deref(), Some("alice"));
-        assert_eq!(t.host, "example.com");
-        assert_eq!(t.ssh_port, Some(2222));
+    fn resolve_with_leaves_the_user_to_ssh_without_user_or_env() {
+        for env_user in [None, Some(String::new())] {
+            let t = resolve_with(
+                &parse_server_string("focalors"),
+                HostEntry::default(),
+                env_user,
+            )
+            .unwrap();
+            assert_eq!(t.user, None);
+        }
+        assert!(resolve_with(&ParsedServer::default(), HostEntry::default(), None).is_none());
     }
 }
