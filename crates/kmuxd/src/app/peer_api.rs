@@ -30,6 +30,16 @@ impl ServerApp {
         wl.draw(&mut rng)
     }
 
+    /// How many session words the shared pool holds, for tests to see a
+    /// word drawn or returned.
+    #[cfg(all(test, feature = "federation"))]
+    pub(crate) fn available_words(&self) -> usize {
+        self.wordlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .available_count()
+    }
+
     /// Return a session word to the shared pool (called when a peer closes).
     #[cfg(feature = "federation")]
     pub fn release_word(&self, word: &str) {

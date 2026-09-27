@@ -1957,15 +1957,20 @@ mod tests {
         };
         let alive = |pid| kill(pid, None).is_ok();
 
-        let (won, winner) = publish("hawk");
-        let (lost, loser) = publish("owl");
+        let hawk = app.draw_word().expect("a word");
+        let owl = app.draw_word().expect("a word");
+        let pool = app.available_words();
+        let (won, winner) = publish(&hawk);
+        let (lost, loser) = publish(&owl);
         assert!(won && !lost);
-        let index = app.peer_manager.word_index.lock().unwrap().clone();
-        assert_eq!(index.get("hawk"), Some(&peer_id));
-        assert!(
-            !index.contains_key("owl"),
-            "the loser's word is not indexed"
+        assert_eq!(
+            app.available_words(),
+            pool + 1,
+            "the loser's word is returned"
         );
+        let index = app.peer_manager.word_index.lock().unwrap().clone();
+        assert_eq!(index.get(&hawk), Some(&peer_id));
+        assert!(!index.contains_key(&owl), "the loser's word is not indexed");
         let mut gone = false;
         for _ in 0..200 {
             if !alive(loser) {
