@@ -202,11 +202,9 @@ fn open_append(path: &Path) -> io::Result<(File, u64)> {
     Ok((file, len))
 }
 
-/// `daemon.log` → `daemon.log.<n>`.
+/// `daemon.log` → `daemon.log.<n>`, named as the log readers expect.
 fn rotated_path(path: &Path, n: u32) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(format!(".{n}"));
-    PathBuf::from(name)
+    kmux_sys::log_tail::rotated_log_path(path, n)
 }
 
 /// Rename `from` to `to`; a `from` that does not exist yet is not an error.
