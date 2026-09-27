@@ -3,12 +3,15 @@
 use super::*;
 
 impl SessionManager {
-    /// Handle a `SessionListResult` frame.
+    /// Handle a `SessionListResult` frame — an answer to `SessionList`, or the
+    /// resync the daemon sends after this connection missed events (issue
+    /// #208). Either way it is the whole truth: a session missing from it is
+    /// gone, and the viewed tab is reconciled against its layout.
     pub(super) fn on_session_list_result(
         &mut self,
         sessions: &[SessionEntry],
     ) -> Vec<SessionEvent> {
-        let mut events = Vec::new();
+        let mut events = self.forget_unlisted_sessions(sessions);
         self.session_list = sessions.to_vec();
         for entry in sessions {
             for pane in &entry.panes {
@@ -28,13 +31,40 @@ impl SessionManager {
             if let Some(first) = sessions.first().map(|e| e.meta.word_id.clone()) {
                 self.select_session(first);
             }
-        } else if self.visible_panes.is_empty()
-            && let Some(word) = self.active_session.clone()
-        {
-            self.select_session(word);
+        } else if let Some(word) = self.active_session.clone() {
+            self.reconcile_viewed_tab(word);
         }
         events.push(SessionEvent::SessionListReceived);
         events
+    }
+
+    /// Forget every known session `listed` no longer has, as if its
+    /// `SessionClosed` had arrived. The viewed session goes last, so its
+    /// fallback lands on a session that survives.
+    fn forget_unlisted_sessions(&mut self, listed: &[SessionEntry]) -> Vec<SessionEvent> {
+        let mut gone: Vec<WordId> = self
+            .session_list
+            .iter()
+            .map(|e| e.meta.word_id.clone())
+            .filter(|word| !listed.iter().any(|e| e.meta.word_id == *word))
+            .collect();
+        gone.sort_by_key(|word| self.active_session.as_deref() == Some(word.as_str()));
+        gone.into_iter()
+            .filter_map(|word| self.on_session_gone(word))
+            .collect()
+    }
+
+    /// Bring the viewed tab of `word` in line with the freshly listed layout:
+    /// re-select the session when its tab is gone or nothing is visible, else
+    /// attach and detach to match the tab's panes.
+    fn reconcile_viewed_tab(&mut self, word: WordId) {
+        let view = self
+            .active_tab
+            .and_then(|tab_index| self.tab_view(&word, tab_index));
+        match view {
+            Some((_, visible)) if !self.visible_panes.is_empty() => self.set_visible_set(visible),
+            _ => self.select_session(word),
+        }
     }
 
     /// Handle a `ClosedSessionListResult` frame.

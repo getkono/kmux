@@ -469,6 +469,8 @@ When the supervisor promotes a new transport:
 
 No session state (panes, scrollback, environment) is lost during transport swaps.
 
+**Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on (issue #208). The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab is reconciled against its listed layout.
+
 ---
 
 ## Explicit Decision Table

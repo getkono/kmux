@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 pub type RequestId = u64;
 
+/// The `request_id` of a `SessionListResult` nobody asked for: the daemon
+/// sends one after this connection missed server events (a lagged event
+/// forwarder), so the client can reconcile its sessions, tabs and layouts
+/// against the full list (issue #208). A client's own request ids count up
+/// from zero and never reach it.
+pub const RESYNC_REQUEST_ID: RequestId = RequestId::MAX;
+
 /// Opaque connection identity assigned by the server on first authentication.
 ///
 /// Survives transport switches: when a client re-authenticates on a new channel

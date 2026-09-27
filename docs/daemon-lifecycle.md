@@ -416,6 +416,10 @@ vt_task:       app.subscribe_vt_events() → ctrl_tx                   (after au
 ping_task:     every 5 s: send Ping{seq}, record send time for RTT   (after auth)
 ```
 
+`event_task` and `vt_task` are one function, `forward_broadcast`. When the
+connection falls behind a broadcast it is sent a resync `SessionListResult`
+(`RESYNC_REQUEST_ID`) and the task carries on (issue #208).
+
 All of them are instrumented with the per-connection tracing span. The
 outbound queue is bounded; see [connection.md](connection.md#server-side-flow-control-and-deadlines)
 for its two lanes, how a lagged pane stream recovers, and the deadlines.

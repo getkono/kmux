@@ -779,7 +779,7 @@ count = 7
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::needless_continue"
-count = 5
+count = 4
 
 [[lints]]
 crate = "kmuxd"

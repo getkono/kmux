@@ -4,8 +4,8 @@ use std::sync::atomic::AtomicU64;
 
 use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
-    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
-    SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, ServerMessage, SessionEntry,
+    SessionMeta, SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -200,6 +200,25 @@ impl ServerApp {
             sessions.values().map(Self::build_session_entry).collect();
         entries.sort_by_key(|e| e.meta.index);
         entries
+    }
+
+    /// Every session a client can see: the locally hosted ones, then every
+    /// open peer's proxied ones (local IDs, peer-decorated names). What
+    /// `SessionList` answers.
+    pub async fn all_sessions(&self) -> Vec<SessionEntry> {
+        let mut sessions = self.list_sessions().await;
+        sessions.extend(self.list_federated_sessions());
+        sessions
+    }
+
+    /// An unsolicited `SessionListResult` (`RESYNC_REQUEST_ID`) carrying every
+    /// session with its tabs and layouts: what a connection that missed server
+    /// events is sent so it converges (issue #208).
+    pub async fn session_list_resync(&self) -> ServerMessage {
+        ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: self.all_sessions().await,
+        }
     }
 
     /// Sample the process tree of every locally-hosted pane (issue #122).
