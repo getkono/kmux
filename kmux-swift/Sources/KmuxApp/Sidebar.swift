@@ -130,7 +130,14 @@ private struct SessionRow: View {
                 Text(session.name)
                     .font(.callout.weight(session.active ? .semibold : .medium))
                     .lineLimit(1)
-                if !session.cwd.isEmpty {
+                if session.unreachable {
+                    // The hub lost its link to this session's peer and is
+                    // re-opening it (issue #208).
+                    Label("Unreachable — reconnecting", systemImage: "wifi.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                } else if !session.cwd.isEmpty {
                     Text(session.cwd)
                         .font(.caption)
                         .foregroundStyle(.secondary)

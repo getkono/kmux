@@ -113,6 +113,9 @@ pub struct FfiSession {
     /// The federated peer this session lives on (issue #121), or `None` for a
     /// local session. Lets the sidebar group sessions by machine.
     pub peer: Option<String>,
+    /// The session's peer is unreachable: the hub lost its link and is
+    /// re-opening it (issue #208).
+    pub unreachable: bool,
 }
 
 /// One pane (tab) in the active session.

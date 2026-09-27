@@ -315,6 +315,7 @@ impl KmuxDriver {
                 name: e.meta.name.clone(),
                 cwd: e.meta.cwd.clone(),
                 peer: e.peer.clone(),
+                unreachable: e.peer_unreachable,
             })
             .collect()
     }
