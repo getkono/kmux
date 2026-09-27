@@ -165,12 +165,34 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
         ConnectResult::Failed(e) => return Err(format!("peer connect failed: {e}")),
     };
 
-    // 2. Answer the identity challenge with our own key, then await the
-    //    authentication result (issue #146). The hub authenticates upstream as
-    //    a distinct cryptographic entity, so the peer's client list shows it as
-    //    one connection.
+    // 2–3. Authenticate, then fetch the session list.
+    let sessions = handshake(
+        &client_tx,
+        &mut server_rx,
+        kmux_connect::tcp_connect::answer_auth_challenge,
+    )
+    .await?;
+
+    Ok(Upstream {
+        client_tx,
+        server_rx,
+        sessions,
+        tunnel,
+    })
+}
+
+/// The handshake on an opened link: answer the identity challenge with
+/// `answer` (our own key, in production), await the authentication result,
+/// then fetch the peer's session list. The hub authenticates upstream as a
+/// distinct cryptographic entity (issue #146), so the peer's client list shows
+/// it as one connection.
+pub(super) async fn handshake(
+    client_tx: &mpsc::UnboundedSender<ClientMessage>,
+    server_rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    answer: impl Fn(&mpsc::UnboundedSender<ClientMessage>, &[u8]) -> bool,
+) -> Result<Vec<SessionEntry>, String> {
     loop {
-        match recv_until(&mut server_rx, AUTH_TIMEOUT, |m| {
+        match recv_until(server_rx, AUTH_TIMEOUT, |m| {
             matches!(
                 m,
                 ServerMessage::AuthChallenge { .. } | ServerMessage::AuthResult { .. }
@@ -179,7 +201,7 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
         .await
         {
             Some(ServerMessage::AuthChallenge { nonce }) => {
-                if !kmux_connect::tcp_connect::answer_auth_challenge(&client_tx, &nonce) {
+                if !answer(client_tx, &nonce) {
                     return Err("failed to answer peer identity challenge".to_string());
                 }
             }
@@ -198,7 +220,6 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
         }
     }
 
-    // 3. Fetch the remote session list.
     if client_tx
         .send(ClientMessage::SessionList { request_id: 1 })
         .is_err()
@@ -206,20 +227,14 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
         return Err("peer connection closed before session list".to_string());
     }
     let Some(ServerMessage::SessionListResult { sessions, .. }) =
-        recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
+        recv_until(server_rx, LIST_TIMEOUT, |m| {
             matches!(m, ServerMessage::SessionListResult { .. })
         })
         .await
     else {
         return Err("peer did not return a session list in time".to_string());
     };
-
-    Ok(Upstream {
-        client_tx,
-        server_rx,
-        sessions,
-        tunnel,
-    })
+    Ok(sessions)
 }
 
 /// Why a link ended.
@@ -568,6 +583,106 @@ mod tests {
         assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
         let listed = app.list_federated_sessions();
         assert!(!listed[0].peer_unreachable);
+    }
+
+    fn auth_result(success: bool, reason: Option<&str>) -> ServerMessage {
+        ServerMessage::AuthResult {
+            success,
+            reason: reason.map(str::to_string),
+            client_id: None,
+            server_version: None,
+            connection_id: None,
+            compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: kmux_protocol::messages::protocol_capabilities(),
+        }
+    }
+
+    /// Run [`handshake`] against the scripted peer `frames`, answering each
+    /// challenge with `answers` (and recording its nonce). Returns the
+    /// outcome, the nonces answered and what the hub sent the peer.
+    async fn run_handshake(
+        frames: Vec<ServerMessage>,
+        answers: bool,
+    ) -> (
+        Result<Vec<String>, String>,
+        Vec<Vec<u8>>,
+        Vec<ClientMessage>,
+    ) {
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let (server_tx, mut server_rx) = mpsc::unbounded_channel();
+        for frame in frames {
+            server_tx.send(frame).unwrap();
+        }
+        let nonces = Mutex::new(Vec::new());
+        let result = handshake(&client_tx, &mut server_rx, |_, nonce| {
+            nonces.lock().unwrap().push(nonce.to_vec());
+            answers
+        })
+        .await
+        .map(|sessions| sessions.into_iter().map(|e| e.meta.word_id).collect());
+        drop(server_tx);
+        let mut sent = Vec::new();
+        while let Ok(msg) = client_rx.try_recv() {
+            sent.push(msg);
+        }
+        (result, nonces.into_inner().unwrap(), sent)
+    }
+
+    /// A handshake answers the challenge, takes the result, asks for the
+    /// peer's list and returns it.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_answers_the_challenge_then_fetches_the_list() {
+        let (result, nonces, sent) = run_handshake(
+            vec![
+                ServerMessage::AuthChallenge { nonce: vec![7; 4] },
+                auth_result(true, None),
+                ServerMessage::SessionListResult {
+                    request_id: 1,
+                    sessions: vec![crate::federation::sample_remote_entry("fedremote")],
+                },
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(result, Ok(vec!["fedremote".to_string()]));
+        assert_eq!(nonces, vec![vec![7; 4]]);
+        assert!(matches!(
+            sent.as_slice(),
+            [ClientMessage::SessionList { request_id: 1 }]
+        ));
+    }
+
+    /// A handshake fails when the challenge cannot be answered, when the
+    /// peer refuses (with its reason), or when the peer never answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_fails_on_an_unanswered_challenge_a_refusal_or_silence() {
+        let challenge = || ServerMessage::AuthChallenge { nonce: vec![1] };
+        let (result, _, _) = run_handshake(vec![challenge(), auth_result(true, None)], false).await;
+        assert_eq!(
+            result,
+            Err("failed to answer peer identity challenge".to_string())
+        );
+        let (result, _, sent) =
+            run_handshake(vec![auth_result(false, Some("bad token"))], true).await;
+        assert_eq!(
+            result,
+            Err("peer rejected authentication: bad token".to_string())
+        );
+        assert!(sent.is_empty(), "no list asked for");
+        let (result, _, _) = run_handshake(vec![auth_result(true, None)], true).await;
+        assert_eq!(
+            result,
+            Err("peer did not return a session list in time".to_string())
+        );
+        let (result, _, _) = run_handshake(Vec::new(), true).await;
+        assert_eq!(
+            result,
+            Err("peer did not complete authentication in time".to_string())
+        );
     }
 
     /// A peer the user closed while its link was being re-opened is not

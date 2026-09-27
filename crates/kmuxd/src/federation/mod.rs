@@ -533,19 +533,35 @@ impl PeerManager {
             conn.register_session(local_word, remote_word, entry, &peer_id);
         }
 
-        // Publish the peer. The reuse check at the top of `open_peer` is not
-        // atomic with this insert across the `await`-heavy connect above, so two
-        // GUIs federating the *same* target concurrently can both reach here.
-        // Decide the winner under a single `peers` lock — the winner spawns its
-        // link and inserts; a loser tears its duplicate down (closing the
-        // redundant upstream link + SSH tunnel and releasing its drawn words) and
-        // reuses the winner — so a race can never leak a connection or corrupt the
-        // word index. The word index is published only by the winner, while still
-        // holding `peers`, so a lookup that sees a word also finds its connection.
+        if self.publish_peer(app, &peer_id, conn, server_rx, &assigned_words) {
+            info!(%peer_id, sessions = assigned_words.len(), "federated peer opened");
+        }
+        Ok(peer_id)
+    }
+
+    /// Publish `conn` as `peer_id`, with the words it drew; whether it won.
+    ///
+    /// The reuse check at the top of `open_peer` is not atomic with this
+    /// insert across the `await`-heavy connect, so two GUIs federating the
+    /// *same* target concurrently can both reach here. The winner is decided
+    /// under a single `peers` lock — the winner spawns its link and inserts; a
+    /// loser tears its duplicate down (closing the redundant upstream link +
+    /// SSH tunnel and releasing its drawn words) and reuses the winner — so a
+    /// race can never leak a connection or corrupt the word index. The word
+    /// index is published only by the winner, while still holding `peers`, so
+    /// a lookup that sees a word also finds its connection.
+    fn publish_peer(
+        &self,
+        app: &Arc<ServerApp>,
+        peer_id: &PeerId,
+        conn: PeerConnection,
+        server_rx: mpsc::UnboundedReceiver<ServerMessage>,
+        assigned_words: &[String],
+    ) -> bool {
         let conn = Arc::new(Mutex::new(conn));
         let won = {
             let mut peers = self.peers.lock().unwrap();
-            if peers.contains_key(&peer_id) {
+            if peers.contains_key(peer_id) {
                 false
             } else {
                 let task = link::spawn_link(
@@ -557,7 +573,7 @@ impl PeerManager {
                 conn.lock().unwrap().feed_task = Some(task);
                 peers.insert(peer_id.clone(), Arc::clone(&conn));
                 let mut idx = self.word_index.lock().unwrap();
-                for w in &assigned_words {
+                for w in assigned_words {
                     idx.insert(w.clone(), peer_id.clone());
                 }
                 true
@@ -571,15 +587,12 @@ impl PeerManager {
             if let Some(mut child) = conn.lock().unwrap().ssh_tunnel.take() {
                 let _ = child.start_kill();
             }
-            for w in &assigned_words {
+            for w in assigned_words {
                 app.release_word(w);
             }
             debug!(%peer_id, "lost concurrent open race; discarded duplicate peer link");
-            return Ok(peer_id);
         }
-
-        info!(%peer_id, sessions = assigned_words.len(), "federated peer opened");
-        Ok(peer_id)
+        won
     }
 
     /// Bring the hub's listing of `peer_id`'s sessions in line with the list
@@ -1903,6 +1916,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(gone, "a dropped TunnelGuard must kill the tunnel process");
+    }
+
+    /// Two opens of the same peer racing to publish: the first wins and keeps
+    /// its link, words and tunnel; the second is torn down — its tunnel
+    /// killed, its words never indexed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_loser_of_a_concurrent_open_is_torn_down() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let app = Arc::new(crate::fixtures::fixture_app());
+        let peer_id = "box:9000".to_string();
+        let publish = |local_word: &str| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut conn = PeerConnection::new(tx, no_reconnect());
+            let child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep");
+            let pid =
+                Pid::from_raw(i32::try_from(child.id().expect("child pid")).expect("pid fits"));
+            conn.ssh_tunnel = Some(child);
+            conn.register_session(
+                local_word.to_string(),
+                "remote".to_string(),
+                sample_remote_entry("remote"),
+                &peer_id,
+            );
+            let (_server_tx, server_rx) = mpsc::unbounded_channel();
+            let won = app.peer_manager.publish_peer(
+                &app,
+                &peer_id,
+                conn,
+                server_rx,
+                &[local_word.to_string()],
+            );
+            (won, pid)
+        };
+        let alive = |pid| kill(pid, None).is_ok();
+
+        let (won, winner) = publish("hawk");
+        let (lost, loser) = publish("owl");
+        assert!(won && !lost);
+        let index = app.peer_manager.word_index.lock().unwrap().clone();
+        assert_eq!(index.get("hawk"), Some(&peer_id));
+        assert!(
+            !index.contains_key("owl"),
+            "the loser's word is not indexed"
+        );
+        let mut gone = false;
+        for _ in 0..200 {
+            if !alive(loser) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "the loser's tunnel is killed");
+        assert!(alive(winner), "the winner's tunnel lives on");
+        app.peer_manager.close_all();
     }
 
     /// A word still names a peer's session only while that peer is open and
