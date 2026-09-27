@@ -30,7 +30,77 @@ pub const DAEMON_BOOT_ARGS: &[&str] = &["--daemon", "--bind", "0.0.0.0", "--port
 ///
 /// 2 (issue #207): [`HandoffMessage::Abort`], and the successor waits for
 /// `Released` or `Abort` after a `Decline` as it does after its `Ack`.
-pub const HANDOFF_PROTOCOL_VERSION: u32 = 2;
+///
+/// 3 (issue #207): `Hello` carries the predecessor's `pid`, which the
+/// successor cross-checks against the socket's peer credentials; the successor
+/// is the predecessor's direct child (it no longer daemonizes itself), so the
+/// predecessor can stop it and learn how it exited.
+pub const HANDOFF_PROTOCOL_VERSION: u32 = 3;
+
+/// Exit code of a handoff successor that stands down: the predecessor rolled
+/// the handoff back, or could not be ruled out as still serving, so this
+/// daemon exits without serving. Distinct from a failure (`1`), so the
+/// predecessor that spawned it can tell the two apart. `EX_TEMPFAIL`.
+pub const HANDOFF_STOOD_DOWN_EXIT_CODE: i32 = 75;
+
+/// Every bound on a graceful handoff, in one place (issue #207). Fixed, not
+/// configurable: the two daemons (and `kmux daemon restart`) must agree on
+/// them, and each is sized for a local exchange between two processes.
+pub mod handoff_timeouts {
+    use std::time::Duration;
+
+    /// Longest the predecessor waits for the successor it spawned to start
+    /// and connect. On expiry it kills that successor and rolls back.
+    pub const SUCCESSOR_CONNECT: Duration = Duration::from_secs(15);
+
+    /// How long a successor keeps retrying the handoff socket. Shorter than
+    /// [`SUCCESSOR_CONNECT`], so a successor that gives up does so while its
+    /// predecessor still waits for it.
+    pub const PREDECESSOR_CONNECT: Duration = Duration::from_secs(10);
+
+    /// Longest one step may take: one frame to arrive or go out. The longest
+    /// step, waiting for `Complete`, covers the predecessor's final
+    /// checkpoint write.
+    pub const STEP: Duration = Duration::from_secs(30);
+
+    /// Longest the predecessor's PTY readers may take to park for the final
+    /// checkpoint.
+    pub const HOLD: Duration = Duration::from_secs(5);
+
+    /// Longest the parked readers wait, after the final checkpoint, for the
+    /// `Complete`/`Ack` exchange that commits the handoff. Short, because the
+    /// panes are frozen meanwhile: a rollback releases them by then.
+    pub const FROZEN: Duration = Duration::from_secs(10);
+
+    /// How long a successor that lost its predecessor mid-handoff gives it
+    /// to exit before taking it to be serving still (and standing down).
+    pub const PREDECESSOR_EXIT_GRACE: Duration = Duration::from_secs(15);
+
+    /// How often a successor checks whether its predecessor has exited.
+    pub const PREDECESSOR_POLL: Duration = Duration::from_millis(100);
+
+    /// How long the predecessor gives a successor it told to stand down to
+    /// exit before killing it.
+    pub const SUCCESSOR_STAND_DOWN_GRACE: Duration = Duration::from_secs(5);
+
+    /// How long a successor waits for its predecessor to exit before it
+    /// claims the pid file anyway.
+    pub const PID_FILE_CLAIM: Duration = Duration::from_secs(10);
+
+    /// How long `kmux daemon restart` waits for the handoff to end, either
+    /// way. A safety net: the predecessor reports a rollback as soon as it
+    /// has one, and a commit shows as the successor's pid.
+    pub const RESTART_WAIT: Duration = Duration::from_secs(120);
+
+    // The bounds nest: a successor gives up connecting while its predecessor
+    // still waits for it, the frozen window is shorter than a step, and the
+    // CLI outwaits a handoff that fails at its slowest single step.
+    const _: () = {
+        assert!(PREDECESSOR_CONNECT.as_millis() < SUCCESSOR_CONNECT.as_millis());
+        assert!(FROZEN.as_millis() < STEP.as_millis());
+        assert!(RESTART_WAIT.as_millis() > SUCCESSOR_CONNECT.as_millis() + STEP.as_millis());
+    };
+}
 
 /// JSON request sent to the daemon control socket.
 #[derive(Deserialize)]
@@ -99,6 +169,25 @@ pub struct StopResponse {
 pub struct RestartResponse {
     pub status: String,
     pub handoff: bool,
+    /// Number of the handoff this restart started, for matching its
+    /// [`HandoffReport`]. `0` from a daemon that predates reports.
+    #[serde(default)]
+    pub attempt: u64,
+}
+
+/// JSON response to the `"handoff"` control command: how the daemon's latest
+/// graceful handoff stands (issue #207). `kmux daemon restart` polls it to
+/// report a handoff that stood down instead of timing out on it. A daemon
+/// that predates it closes the connection without replying.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct HandoffReport {
+    /// Number of the latest handoff; `0` before the first.
+    pub attempt: u64,
+    /// Whether that handoff is still running.
+    pub in_progress: bool,
+    /// Why it stood down, when it rolled back and this daemon kept serving.
+    #[serde(default)]
+    pub stood_down: Option<String>,
 }
 
 /// JSON response to the `"connections"` control command: every live client
@@ -164,6 +253,11 @@ pub enum HandoffMessage {
         version: u32,
         token: String,
         panes: Vec<HandoffPaneMeta>,
+        /// O's pid (version 3). N takes it as O's identity only when it
+        /// matches the socket's peer credentials. `0` from an O older than
+        /// version 3, which N declines anyway.
+        #[serde(default)]
+        pid: u32,
     },
     /// N → O: N speaks the same handoff version and will pull the live fds.
     Accept,
@@ -402,11 +496,44 @@ mod tests {
             let json = serde_json::to_string(&RestartResponse {
                 status: "ok".into(),
                 handoff,
+                attempt: 7,
             })
             .expect("serialize");
             let back: RestartResponse = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back.status, "ok");
             assert_eq!(back.handoff, handoff);
+            assert_eq!(back.attempt, 7);
+        }
+        let old: RestartResponse =
+            serde_json::from_str(r#"{"status":"ok","handoff":true}"#).expect("an older daemon");
+        assert_eq!(old.attempt, 0);
+    }
+
+    #[test]
+    fn a_handoff_report_round_trips_and_defaults_its_reason() {
+        let report = HandoffReport {
+            attempt: 3,
+            in_progress: false,
+            stood_down: Some("successor did not connect".into()),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: HandoffReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, report);
+        let minimal: HandoffReport =
+            serde_json::from_str(r#"{"attempt":1,"in_progress":true}"#).expect("minimal");
+        assert_eq!(minimal.stood_down, None);
+    }
+
+    /// A version-3 `Hello` carries the predecessor's pid; one from an older
+    /// predecessor has none, and reads as pid 0.
+    #[test]
+    fn a_hello_without_a_pid_reads_as_pid_zero() {
+        let old = r#"{"Hello":{"version":2,"token":"t","panes":[]}}"#;
+        match serde_json::from_str::<HandoffMessage>(old).expect("deserialize") {
+            HandoffMessage::Hello { version, pid, .. } => {
+                assert_eq!((version, pid), (2, 0));
+            }
+            other => panic!("expected Hello, got {other:?}"),
         }
     }
 
@@ -420,6 +547,7 @@ mod tests {
                 pid: 4242,
                 has_live_fd: true,
             }],
+            pid: 99,
         };
         let json = serde_json::to_string(&hello).expect("serialize");
         let back: HandoffMessage = serde_json::from_str(&json).expect("deserialize");
@@ -428,8 +556,10 @@ mod tests {
                 version,
                 token,
                 panes,
+                pid,
             } => {
                 assert_eq!(version, HANDOFF_PROTOCOL_VERSION);
+                assert_eq!(pid, 99);
                 assert_eq!(token, "tok");
                 assert_eq!(panes.len(), 1);
                 assert_eq!(panes[0].pane_id, "eagle/0");

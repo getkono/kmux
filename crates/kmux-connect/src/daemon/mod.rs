@@ -217,22 +217,71 @@ pub async fn stop_daemon_at(socket_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How the daemon answered a `restart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartReply {
+    /// It began a handoff.
+    Accepted {
+        /// The handoff's number (`0` from a daemon that does not number
+        /// them, and so cannot report on them either).
+        attempt: u64,
+    },
+    /// A handoff is already running.
+    Busy,
+}
+
 /// Ask the running daemon to perform a graceful live-PTY handoff to a successor.
 ///
-/// Returns `Ok(true)` when the daemon accepted the handoff (running shells will
-/// migrate), `Ok(false)` when it reports `busy`, and `Err(_)` when the daemon is
-/// too old to understand `restart` (it closes the connection without replying,
-/// so the response cannot be read) or is unreachable. The caller falls back to a
-/// hard stop-then-respawn restart in those cases.
-pub async fn restart_daemon() -> anyhow::Result<bool> {
+/// Returns whether the daemon accepted the handoff (running shells will
+/// migrate) or reports `busy`, and `Err(_)` when the daemon is too old to
+/// understand `restart` (it closes the connection without replying, so the
+/// response cannot be read) or is unreachable. The caller falls back to a hard
+/// stop-then-respawn restart in those cases.
+///
+/// # Errors
+///
+/// When the daemon is unreachable or does not understand `restart`.
+pub async fn restart_daemon() -> anyhow::Result<RestartReply> {
     restart_daemon_at(&control_socket()?).await
 }
 
 /// [`restart_daemon`] against an explicit control socket.
-pub async fn restart_daemon_at(socket_path: &Path) -> anyhow::Result<bool> {
+///
+/// # Errors
+///
+/// As [`restart_daemon`].
+pub async fn restart_daemon_at(socket_path: &Path) -> anyhow::Result<RestartReply> {
     use kmux_protocol::control_rpc::RestartResponse;
     let resp: RestartResponse = control_request_at(socket_path, "restart").await?;
-    Ok(resp.status == "ok")
+    Ok(if resp.status == "ok" {
+        RestartReply::Accepted {
+            attempt: resp.attempt,
+        }
+    } else {
+        RestartReply::Busy
+    })
+}
+
+/// Where the daemon's latest graceful handoff stands (issue #207): whether it
+/// still runs, and why it stood down if it rolled back. `Err` from a daemon
+/// that predates the report (it closes the connection without replying).
+///
+/// # Errors
+///
+/// When the daemon is unreachable or predates the report.
+pub async fn query_handoff() -> anyhow::Result<kmux_protocol::control_rpc::HandoffReport> {
+    query_handoff_at(&control_socket()?).await
+}
+
+/// [`query_handoff`] against an explicit control socket.
+///
+/// # Errors
+///
+/// As [`query_handoff`].
+pub async fn query_handoff_at(
+    socket_path: &Path,
+) -> anyhow::Result<kmux_protocol::control_rpc::HandoffReport> {
+    control_request_at(socket_path, "handoff").await
 }
 
 /// Query the daemon for its active sessions and per-connection metrics.
@@ -525,8 +574,9 @@ mod tests {
 
     /// The `restart` control RPC has three outcomes the `kmux daemon restart`
     /// command branches on (see `kmux-app/src/subcommands/daemon_cmd.rs`):
-    ///   - `{"status":"ok"}`   → `Ok(true)`  — graceful handoff accepted
-    ///   - `{"status":"busy"}` → `Ok(false)` — a restart is already in progress
+    ///   - `{"status":"ok"}`   → `Accepted` — graceful handoff accepted, with
+    ///     its number (`0` from a daemon that does not number them)
+    ///   - `{"status":"busy"}` → `Busy` — a restart is already in progress
     ///   - connection closed without a reply → `Err` — daemon predates `restart`,
     ///     so the caller falls back to a hard stop-then-respawn.
     #[tokio::test]
@@ -540,7 +590,8 @@ mod tests {
 
         // Serve three connections in order: accept, busy, then close-without-reply.
         tokio::spawn(async move {
-            let replies: [Option<&str>; 3] = [
+            let replies: [Option<&str>; 4] = [
+                Some(r#"{"status":"ok","handoff":true,"attempt":4}"#),
                 Some(r#"{"status":"ok","handoff":true}"#),
                 Some(r#"{"status":"busy","handoff":false}"#),
                 None, // mimic an old daemon: close without replying
@@ -562,21 +613,68 @@ mod tests {
             }
         });
 
-        assert!(
+        assert_eq!(
             restart_daemon_at(&socket_path)
                 .await
                 .expect("accepted reply parses"),
+            RestartReply::Accepted { attempt: 4 },
             "status=ok must report an accepted handoff"
         );
-        assert!(
-            !restart_daemon_at(&socket_path)
+        assert_eq!(
+            restart_daemon_at(&socket_path)
+                .await
+                .expect("an older daemon's reply parses"),
+            RestartReply::Accepted { attempt: 0 },
+        );
+        assert_eq!(
+            restart_daemon_at(&socket_path)
                 .await
                 .expect("busy reply parses"),
+            RestartReply::Busy,
             "status=busy must report no handoff"
         );
         assert!(
             restart_daemon_at(&socket_path).await.is_err(),
             "a daemon that closes without replying must surface as Err (unsupported)"
+        );
+    }
+
+    /// `handoff` reads the daemon's report of its latest handoff (issue
+    /// #207), and a daemon that predates it is an `Err`.
+    #[tokio::test]
+    async fn query_handoff_reads_the_report() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_in(&tmp);
+        let listener = UnixListener::bind(&socket_path).expect("bind control socket");
+        tokio::spawn(async move {
+            let replies = [
+                Some(r#"{"attempt":2,"in_progress":false,"stood_down":"no Ack"}"#),
+                None,
+            ];
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read_half, mut write_half) = stream.into_split();
+                let mut line = String::new();
+                let _ = BufReader::new(read_half).read_line(&mut line).await;
+                assert!(line.contains("\"handoff\""), "expected a handoff command");
+                if let Some(body) = reply {
+                    let _ = write_half.write_all(format!("{body}\n").as_bytes()).await;
+                }
+            }
+        });
+
+        let report = query_handoff_at(&socket_path).await.expect("a report");
+        assert_eq!(report.attempt, 2);
+        assert!(!report.in_progress);
+        assert_eq!(report.stood_down.as_deref(), Some("no Ack"));
+        assert!(
+            query_handoff_at(&socket_path).await.is_err(),
+            "an older daemon"
         );
     }
 }

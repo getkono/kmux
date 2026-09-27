@@ -26,6 +26,9 @@ impl ServerApp {
         use std::collections::HashMap;
         use std::sync::atomic::Ordering;
 
+        // Held until the pane is in `sessions`, so a handoff never misses it.
+        let _admitted = self.admit_pane_creation()?;
+
         // Check the session limit
         {
             let sessions = self.sessions.read().await;

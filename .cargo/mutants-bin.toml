@@ -41,9 +41,11 @@ exclude_globs = [
 exclude_re = [
     'crates/kmuxd/src/main\.rs:.*replace main -> ',
     'crates/kmuxd/src/startup\.rs:.*replace async_main -> ',
-    # `handoff::sender::run` binds the real handoff socket and spawns a
-    # successor daemon; only `handoff_e2e.rs` can call it (issue #207).
+    # `handoff::sender::run` (and `hand_off`, which it runs with pane creation
+    # closed) binds the real handoff socket and spawns a successor daemon;
+    # only `handoff_e2e.rs` can call it (issue #207).
     'crates/kmuxd/src/handoff/sender\.rs:.*replace run -> ',
+    'crates/kmuxd/src/handoff/sender\.rs:.*replace hand_off -> ',
     # An equivalent mutant: `RotatingFile::flush` forwards to `File::flush`,
     # which does nothing (a `File` is unbuffered), so `Ok(())` is the same
     # function (issue #207).

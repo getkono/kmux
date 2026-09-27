@@ -676,6 +676,14 @@ pub struct ServerApp {
     /// On-disk graveyard file path. `None` (the default, e.g. in tests) keeps
     /// the graveyard in memory only and skips all graveyard disk I/O.
     pub(super) graveyard_path: Option<std::path::PathBuf>,
+    /// Pane creation holds this for reading from before its PTY spawns until
+    /// the pane is in `sessions`; a graceful handoff holds it for writing
+    /// from before it advertises the panes, so a pane is either advertised or
+    /// refused, never created unseen (issue #207). See `app/migrate.rs`.
+    pane_gate: Arc<RwLock<()>>,
+    /// Set by a handoff that committed: this daemon is exiting and creates
+    /// no pane again, gate or no gate.
+    pane_creation_ended: AtomicBool,
 }
 
 impl ServerApp {
@@ -709,6 +717,8 @@ impl ServerApp {
             closed_session_keep: crate::config::DEFAULT_CLOSED_SESSION_KEEP as usize,
             closed_session_ttl_ms: crate::config::default_closed_session_ttl_ms(),
             graveyard_path: None,
+            pane_gate: Arc::new(RwLock::new(())),
+            pane_creation_ended: AtomicBool::new(false),
         }
     }
 

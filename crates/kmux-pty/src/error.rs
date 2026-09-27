@@ -51,6 +51,12 @@ pub enum KmuxError {
         pane_id: String,
     },
 
+    /// A graceful daemon restart is handing the panes to a successor, so no
+    /// pane may be created until it ends: one created now would be neither
+    /// handed over nor frozen for the final checkpoint (issue #207).
+    #[error("a daemon restart is in progress; try again once it has finished")]
+    HandoffInProgress,
+
     #[error("send on closed channel")]
     ChannelClosed,
 

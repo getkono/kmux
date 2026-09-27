@@ -321,7 +321,9 @@ unlinks whatever is at its path — and exits with an error if something answers
 race in between, and on a live answer shuts the whole daemon down rather than
 running on headless. A socket file nothing listens on is stale and removed. A
 graceful-restart successor (`--handoff`) skips both checks: its predecessor
-released the socket to it.
+released the socket to it. The one successor that asks too is one that could
+not reach its predecessor's handoff socket: a daemon still answering the control
+socket is serving, so it stands down (issue #207, `docs/daemon-handoff.md`).
 
 "Is anything listening?" is answered by connecting (`socket_is_live`): a
 connection or `EPERM`/`EACCES` means live; `EAGAIN` is asked again up to eight
@@ -902,8 +904,17 @@ sockets, and exits; the successor adopts the auth token and rebuilds each pane
 around the inherited fd. The handoff runs as a task of its own, so SIGINT and
 SIGTERM are still serviced while it runs, and every frame is bounded (issue
 #207). On any failure before the commit point it rolls back and tells the
-successor to stand down. Full sequence, versioning, and fault-tolerance model:
-`docs/daemon-handoff.md`.
+successor to stand down; a SIGINT/SIGTERM before the commit point is such a
+failure (the handoff rolls back, the successor stands down, and this daemon
+shuts down as usual — both stop). The successor is the predecessor's direct
+child (it does not daemonize), so the predecessor also kills one that never
+connects or does not exit after standing down. A successor that stands down
+exits with `HANDOFF_STOOD_DOWN_EXIT_CODE` (75), not 1; the predecessor keeps
+the reason, and `kmux daemon restart` reports it (`handoff stood down: …`)
+from the `handoff` control command instead of timing out. No pane can be
+created while a handoff runs (`KmuxError::HandoffInProgress`). Full sequence,
+versioning, timeouts (`control_rpc::handoff_timeouts`) and fault-tolerance
+model: `docs/daemon-handoff.md`.
 
 This is the mechanism behind a **live upgrade** — `mise run upgrade-daemon` installs a
 new `kmuxd` and restarts onto it without dropping shells (issue #36). The upgrade

@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+use kmux_client::daemon::RestartReply;
+use kmux_protocol::control_rpc::{HandoffReport, handoff_timeouts};
+
 use crate::cli::{DaemonAction, OutputFormat};
 
 use super::render;
@@ -127,9 +130,10 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             // Prefer a graceful live handoff so running shells survive. Fall back
             // to a hard stop-then-respawn against a daemon too old to support it.
             match kmux_client::daemon::restart_daemon().await {
-                Ok(true) => {
-                    // Wait for the successor (a distinct PID) to take over.
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                Ok(RestartReply::Accepted { attempt }) => {
+                    // Wait for the successor (a distinct PID) to take over, or
+                    // for the daemon to report that the handoff stood down.
+                    let deadline = tokio::time::Instant::now() + handoff_timeouts::RESTART_WAIT;
                     loop {
                         tokio::time::sleep(Duration::from_millis(150)).await;
                         if let Some(s) = kmux_client::daemon::query_daemon().await
@@ -141,6 +145,14 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                             );
                             return Ok(());
                         }
+                        let report = kmux_client::daemon::query_handoff().await.ok();
+                        if let Some(why) = report.as_ref().and_then(|r| stood_down(r, attempt)) {
+                            anyhow::bail!(
+                                "handoff stood down: {why}. The previous daemon (PID {old_pid}) \
+                                 kept serving; running shells are intact.{}",
+                                kmux_client::daemon::boot_log_hint()
+                            );
+                        }
                         if tokio::time::Instant::now() >= deadline {
                             anyhow::bail!(
                                 "timed out waiting for the successor daemon to take over. \
@@ -151,7 +163,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                         }
                     }
                 }
-                Ok(false) => {
+                Ok(RestartReply::Busy) => {
                     anyhow::bail!("a restart is already in progress");
                 }
                 Err(_) => {
@@ -474,13 +486,45 @@ async fn query_pane_processes(
     }
 }
 
+/// Why handoff number `attempt` stood down, once `report` says it has: it is
+/// that handoff (a daemon that does not number them reports none), it ended,
+/// and it rolled back.
+fn stood_down(report: &HandoffReport, attempt: u64) -> Option<&str> {
+    if attempt == 0 || report.attempt != attempt || report.in_progress {
+        return None;
+    }
+    report.stood_down.as_deref()
+}
+
 #[cfg(test)]
 mod tests {
+    use kmux_protocol::control_rpc::HandoffReport;
     use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
     use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
     use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
-    use super::stream_logs;
+    use super::{stood_down, stream_logs};
+
+    /// `kmux daemon restart` reports a stand-down only for its own handoff,
+    /// once that handoff has ended, and only when the daemon numbers them.
+    #[test]
+    fn a_stand_down_is_reported_only_for_this_restarts_ended_handoff() {
+        let report = |attempt, in_progress| HandoffReport {
+            attempt,
+            in_progress,
+            stood_down: Some("no Ack".into()),
+        };
+        assert_eq!(stood_down(&report(2, false), 2), Some("no Ack"));
+        assert_eq!(stood_down(&report(2, true), 2), None, "still running");
+        assert_eq!(stood_down(&report(3, false), 2), None, "another handoff");
+        assert_eq!(stood_down(&report(0, false), 0), None, "not numbered");
+        let committed = HandoffReport {
+            attempt: 2,
+            in_progress: false,
+            stood_down: None,
+        };
+        assert_eq!(stood_down(&committed, 2), None);
+    }
 
     /// A connected client/daemon pair, with the daemon's `messages` already
     /// sent and its sending side closed.
