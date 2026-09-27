@@ -41,11 +41,10 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         crate::daemon::ensure_no_live_daemon(&kmux_sys::dirs::socket_path()?)?;
     }
 
-    info!(
-        runtime_dir = %cfg.runtime_dir,
-        allow_peer_cred = cfg.auth.allow_peer_cred,
-        "effective configuration loaded"
-    );
+    info!(runtime_dir = %cfg.runtime_dir, "effective configuration loaded");
+    if let Some(warning) = cfg.auth.retired_key_warning() {
+        warn!("{warning}");
+    }
 
     // ── TLS material ───────────────────────────────────────────────────────────
     // A configured cert/key pair loads a custom certificate; otherwise the

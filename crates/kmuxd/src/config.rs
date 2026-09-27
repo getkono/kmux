@@ -337,17 +337,31 @@ pub struct AuthConfig {
     #[serde(default = "default_auto")]
     pub token_file: String,
 
-    /// Accept `SO_PEERCRED` peer-uid match in lieu of token on UDS connections.
-    #[serde(default = "default_true")]
-    pub allow_peer_cred: bool,
+    /// Retired, and read only so a file that still sets it loads: it once
+    /// promised a peer-UID match in lieu of the token on UDS, which was never
+    /// enforced and has no design (issue #227). Every UDS client reads the
+    /// token from a 0600 file in the same user's runtime dir and proves its
+    /// identity key anyway. See [`AuthConfig::retired_key_warning`].
+    #[serde(default, rename = "allow_peer_cred", skip_serializing)]
+    retired_allow_peer_cred: Option<bool>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             token_file: default_auto(),
-            allow_peer_cred: true,
+            retired_allow_peer_cred: None,
         }
+    }
+}
+
+impl AuthConfig {
+    /// The warning to log when the file still sets a retired key.
+    pub fn retired_key_warning(&self) -> Option<&'static str> {
+        self.retired_allow_peer_cred.map(|_| {
+            "[auth] allow_peer_cred is retired and ignored: every client authenticates \
+             with the token and its identity key; remove it from kmuxd.toml"
+        })
     }
 }
 
@@ -615,8 +629,7 @@ priority = 0
 public_host = "prod.example.com"
 
 [auth]
-token_file = "auto"
-allow_peer_cred = true
+token_file = "/etc/kmuxd/token"
 "#;
 
     #[test]
@@ -650,7 +663,19 @@ allow_peer_cred = true
         );
 
         // Auth
-        assert!(cfg.auth.allow_peer_cred);
+        assert_eq!(cfg.auth.token_file, "/etc/kmuxd/token");
+        assert_eq!(cfg.auth.retired_key_warning(), None);
+    }
+
+    /// `allow_peer_cred` was never enforced and is retired (issue #227), but
+    /// `[auth]` denies unknown fields: a file that still sets it has to load,
+    /// and says so.
+    #[test]
+    fn a_file_setting_the_retired_allow_peer_cred_loads_with_a_warning() {
+        let cfg: ConfigFile = toml::from_str("[auth]\nallow_peer_cred = false\n").unwrap();
+        let warning = cfg.auth.retired_key_warning().expect("a warning");
+        assert!(warning.contains("allow_peer_cred"), "{warning}");
+        assert_eq!(cfg.auth.token_file, "auto");
     }
 
     #[test]
@@ -663,7 +688,7 @@ allow_peer_cred = true
         assert_eq!(cfg.listen[0].kind, ListenKind::Quic);
         assert_eq!(cfg.listen[0].port, 0);
         assert_eq!(cfg.listen[2].audience, Audience::Local); // UDS is local
-        assert!(cfg.auth.allow_peer_cred);
+        assert_eq!(cfg.auth.token_file, "auto");
     }
 
     #[test]

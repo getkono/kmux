@@ -259,7 +259,7 @@ The server dispatches all transports through a single `dispatch_session` → `ru
 
 - The data socket lives at `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`. This is separate from the control socket at `daemon.sock`.
 - The socket's mode is set to 0600 right after it is bound, restricting access to the owning user.
-- Authentication is the same handshake as on every transport: the token and the identity proof. `kmuxd.toml`'s `[auth] allow_peer_cred` is parsed and logged but not enforced — a matching peer UID is not accepted in lieu of the token.
+- Authentication is the same handshake as on every transport: the token and the identity proof. There is no peer-UID shortcut: the retired `[auth] allow_peer_cred` key never had one behind it, and a `kmuxd.toml` that still sets it loads with a warning (issue #227).
 
 ### TLS Trust (TOFU)
 
