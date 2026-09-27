@@ -293,6 +293,15 @@ impl ServerApp {
         }
     }
 
+    /// Call `publish` with [`Self::list_federated_sessions`] while no peer's
+    /// sessions can be added or removed, so what it sends is ordered against
+    /// every such change's own event (issue #208).
+    pub fn publish_federated_sessions<T>(&self, publish: impl FnOnce(Vec<SessionEntry>) -> T) -> T {
+        #[cfg(feature = "federation")]
+        let _membership = self.peer_manager.membership();
+        publish(self.list_federated_sessions())
+    }
+
     /// The process overview of every open peer (issue #122), with pane ids
     /// translated to local form, to be merged into the hub's
     /// `ProcessOverviewResult`. Empty without the feature.

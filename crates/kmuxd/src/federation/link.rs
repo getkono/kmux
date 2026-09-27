@@ -334,7 +334,7 @@ pub(super) fn relink(
 /// came back, or its sessions changed.
 pub(super) async fn broadcast_sessions(app: &Weak<ServerApp>) {
     if let Some(app) = app.upgrade() {
-        app.broadcast(app.session_list_resync_message().await);
+        app.broadcast_session_list().await;
     }
 }
 
@@ -541,7 +541,7 @@ mod tests {
             .await;
             peer.send(ServerMessage::Pong { seq }).unwrap();
         }
-        let listed = app.all_sessions().await;
+        let listed = app.list_federated_sessions();
         assert!(!listed[0].peer_unreachable);
     }
 

@@ -78,6 +78,12 @@ pub struct PeerManager {
     /// `local_word -> PeerId`, so the dispatch layer can resolve a federated
     /// pane to its owning peer with a single lookup.
     word_index: Mutex<HashMap<String, PeerId>>,
+    /// Held while a peer's sessions are added or removed (with the broadcast
+    /// of that change) and while every client is sent the session list, so
+    /// neither overtakes the other: a list taken before a session closed can
+    /// never reach clients after its `SessionClosed` and bring it back
+    /// (issue #208). Taken before `peers`, a connection or `word_index`.
+    membership: Mutex<()>,
 }
 
 /// One local GUI viewing a proxied pane: its bounded data channel, its ctrl
@@ -565,6 +571,7 @@ impl PeerManager {
         peer_id: &str,
         listed: Vec<SessionEntry>,
     ) {
+        let _membership = self.membership();
         let gone: Vec<String> = {
             let guard = lock(conn);
             guard
@@ -677,6 +684,9 @@ impl PeerManager {
         // peer's sessions first; then the session is already registered, and
         // keeps the word it got (issue #208).
         let remote_word = remote_entry.meta.word_id.clone();
+        // Checked and registered under the gate, so a concurrent re-list
+        // cannot register the same session under a second word.
+        let _membership = self.membership();
         let registered = {
             let guard = conn.lock().unwrap();
             guard
@@ -711,6 +721,7 @@ impl PeerManager {
     /// sessions (the other is the peer closing them): every client is sent
     /// `SessionClosed` for each (issue #208).
     pub fn close_peer(&self, app: &ServerApp, peer_id: &str) {
+        let _membership = self.membership();
         let conn = self.peers.lock().unwrap().remove(peer_id);
         let Some(conn) = conn else { return };
         let mut guard = conn.lock().unwrap();
@@ -774,6 +785,14 @@ impl PeerManager {
     ///
     /// The sessions of a peer whose link is down are listed too, flagged
     /// `peer_unreachable` (issue #208).
+    /// Hold the membership gate: no peer's sessions are added or removed
+    /// until the guard drops.
+    pub(crate) fn membership(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.membership
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn list_sessions(&self) -> Vec<SessionEntry> {
         let peers = self.peers.lock().unwrap();
         let mut out = Vec::new();

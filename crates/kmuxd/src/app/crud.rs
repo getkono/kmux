@@ -210,45 +210,51 @@ impl ServerApp {
         entries
     }
 
-    /// Every session a client can see: the locally hosted ones, then every
-    /// open peer's proxied ones (local IDs, peer-decorated names). What
-    /// `SessionList` answers.
-    pub async fn all_sessions(&self) -> Vec<SessionEntry> {
-        let mut sessions = self.list_sessions().await;
-        sessions.extend(self.list_federated_sessions());
-        sessions
+    /// Broadcast to every client an unsolicited `SessionListResult`
+    /// (`RESYNC_REQUEST_ID`) of every session, for when the list changed
+    /// under them all at once: a federated peer went unreachable or came back
+    /// (issue #208). Sent under the session read lock and the federation
+    /// membership gate, like [`Self::send_session_list`], so it cannot
+    /// overtake a concurrent change's own event.
+    #[cfg(feature = "federation")]
+    pub async fn broadcast_session_list(&self) {
+        let sessions = self.sessions.read().await;
+        let mut entries = Self::sorted_entries(&sessions);
+        self.publish_federated_sessions(|federated| {
+            entries.extend(federated);
+            self.broadcast(ServerMessage::SessionListResult {
+                request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+                sessions: entries,
+            });
+        });
+        drop(sessions);
     }
 
-    /// An unsolicited `SessionListResult` (`RESYNC_REQUEST_ID`) of every
-    /// session, for broadcasting to every client when the list changed under
-    /// them all at once — a federated peer went unreachable or came back
-    /// (issue #208).
-    pub async fn session_list_resync_message(&self) -> ServerMessage {
-        ServerMessage::SessionListResult {
-            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
-            sessions: self.all_sessions().await,
-        }
-    }
-
-    /// Queue on `out` an unsolicited `SessionListResult` (`RESYNC_REQUEST_ID`)
-    /// carrying every session with its tabs and layouts: what a connection
-    /// that missed server events is sent so it converges (issue #208).
+    /// Queue on `out` a `SessionListResult` for `request_id` carrying every
+    /// session with its tabs and layouts: the answer to `SessionList`, or —
+    /// with `RESYNC_REQUEST_ID` — what a connection that missed server events
+    /// is sent so it converges (issue #208).
     ///
     /// It is queued while the session map is still read-locked. A local
-    /// session created or closed concurrently therefore either shows in the
-    /// list or completes after it — and its own reply, queued after the
-    /// write lock, reaches the client after the list — so a list taken just
-    /// before a create cannot arrive after its `SessionCreated` and undo it.
-    pub async fn send_session_list_resync(
+    /// session created, closed or re-laid-out concurrently therefore either
+    /// shows in the list or changes after it — and its own reply and event,
+    /// queued after the write lock, reach the client after the list — so a
+    /// list taken just before a change cannot arrive after it and undo it.
+    /// That ordering is what lets a client treat every list as the whole
+    /// truth.
+    pub async fn send_session_list(
         &self,
         out: &crate::outbound::OutboundTx,
+        request_id: kmux_protocol::messages::RequestId,
     ) -> std::result::Result<(), crate::outbound::OutboundClosed> {
         let sessions = self.sessions.read().await;
         let mut entries = Self::sorted_entries(&sessions);
-        entries.extend(self.list_federated_sessions());
-        let sent = out.send(ServerMessage::SessionListResult {
-            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
-            sessions: entries,
+        let sent = self.publish_federated_sessions(|federated| {
+            entries.extend(federated);
+            out.send(ServerMessage::SessionListResult {
+                request_id,
+                sessions: entries,
+            })
         });
         drop(sessions);
         sent

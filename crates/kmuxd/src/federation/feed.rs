@@ -293,8 +293,11 @@ fn on_remote_session_closed(
     conn: &Mutex<PeerConnection>,
     remote_word: &str,
 ) {
-    let local_word = lock(conn).remote_to_local.get(remote_word).cloned();
-    let (Some(app), Some(local_word)) = (app.upgrade(), local_word) else {
+    let Some(app) = app.upgrade() else {
+        return;
+    };
+    let _membership = app.peer_manager.membership();
+    let Some(local_word) = lock(conn).remote_to_local.get(remote_word).cloned() else {
         return;
     };
     app.peer_manager.unregister_session(&app, &local_word);
@@ -360,7 +363,24 @@ mod tests {
             "fedlocal"
         );
         assert!(!app.is_federated_session("fedlocal"));
-        assert!(app.all_sessions().await.is_empty());
+        assert!(app.list_federated_sessions().is_empty());
+    }
+
+    /// A session list is published while no peer's sessions can change, so a
+    /// list taken before a close cannot reach clients after its
+    /// `SessionClosed` and bring the session back (issue #208).
+    #[tokio::test]
+    async fn a_session_list_is_published_while_peer_membership_is_held() {
+        let app = Arc::new(fixture_app());
+        let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (listed, gate_held) = app.publish_federated_sessions(|federated| {
+            (
+                federated.len(),
+                app.peer_manager.membership.try_lock().is_err(),
+            )
+        });
+        assert_eq!((listed, gate_held), (1, true));
+        assert!(app.peer_manager.membership.try_lock().is_ok(), "released");
     }
 
     /// The peer's session list is its whole truth: a session it still lists
@@ -382,7 +402,7 @@ mod tests {
         let words = broadcast_matching(&mut broadcasts, listed).await;
         assert_eq!(words.len(), 2);
         assert!(words.contains(&("fedlocal".to_string(), false)));
-        let sessions = app.all_sessions().await;
+        let sessions = app.list_federated_sessions();
         let kept = sessions
             .iter()
             .find(|e| e.meta.word_id == "fedlocal")
@@ -429,7 +449,7 @@ mod tests {
 
         let tab: TabInfo = tokio::time::timeout(WAIT, async {
             loop {
-                let tab = app.all_sessions().await[0].tabs[0].clone();
+                let tab = app.list_federated_sessions()[0].tabs[0].clone();
                 if tab.layout == split {
                     return tab;
                 }
@@ -471,6 +491,6 @@ mod tests {
             broadcast_matching(&mut broadcasts, closed_word).await,
             "fedlocal"
         );
-        assert!(app.all_sessions().await.is_empty());
+        assert!(app.list_federated_sessions().is_empty());
     }
 }
