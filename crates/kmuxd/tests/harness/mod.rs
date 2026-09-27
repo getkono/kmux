@@ -29,9 +29,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use kmux_client::connect::ConnectResult;
+use kmux_client::grid::CellGrid;
 use kmux_client::tcp_connect::connect_uds;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, PeerTarget, ServerMessage, TermSize,
+    ClientCapabilities, ClientMessage, PeerTarget, SequenceNo, ServerMessage, TermSize,
 };
 use kmux_sys::dirs::Dirs;
 use nix::sys::signal::{Signal, kill};
@@ -130,6 +131,17 @@ impl Sandbox {
     pub fn pid_path(&self) -> PathBuf {
         self.dirs.pid_path().expect("pid path")
     }
+
+    /// What the daemon in this sandbox has logged so far, for a failure
+    /// message: an e2e failure says little without the daemon's side of it.
+    #[must_use]
+    pub fn daemon_log(&self) -> String {
+        self.dirs
+            .daemon_log_path()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for Sandbox {
@@ -183,22 +195,34 @@ pub async fn poll_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool 
     }
 }
 
-/// Read a pid written by a child process, waiting for the file to appear and to
-/// hold a complete line.
-#[must_use]
-pub fn read_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
+/// Poll the async `f` every 50ms until it yields a value or `timeout` elapses.
+pub async fn wait_for<T, F: Future<Output = Option<T>>>(
+    timeout: Duration,
+    mut f: impl FnMut() -> F,
+) -> Option<T> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(s) = std::fs::read_to_string(path)
-            && let Ok(pid) = s.trim().parse::<i32>()
-        {
-            return Some(pid);
+        if let Some(found) = f().await {
+            return Some(found);
         }
         if Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Read a pid written by a child process, waiting for the file to appear and to
+/// hold a complete line.
+pub async fn read_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
+    wait_for(timeout, || async {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
+    })
+    .await
 }
 
 // ─── The daemon under test ───────────────────────────────────────────────────
@@ -227,6 +251,7 @@ pub struct Daemon<'a> {
     sandbox: &'a Sandbox,
     isolation: Option<&'static str>,
     extra_env: Vec<(String, PathBuf)>,
+    config: Option<PathBuf>,
 }
 
 impl<'a> Daemon<'a> {
@@ -238,7 +263,17 @@ impl<'a> Daemon<'a> {
             sandbox,
             isolation: None,
             extra_env: Vec::new(),
+            config: None,
         }
+    }
+
+    /// Run with `toml` as its `kmuxd.toml` (`--config`).
+    #[must_use]
+    pub fn config(mut self, toml: &str) -> Self {
+        let path = self.sandbox.path().join("kmuxd.toml");
+        std::fs::write(&path, toml).expect("write kmuxd.toml");
+        self.config = Some(path);
+        self
     }
 
     /// Run from a different binary — used by the in-place-swap handoff test.
@@ -264,7 +299,7 @@ impl<'a> Daemon<'a> {
     /// `exclude` skips a pid that is already listening — the handoff suite uses
     /// it to wait for the *successor* rather than re-observing the predecessor.
     pub async fn spawn(self, exclude: Option<u32>) -> u32 {
-        let mut args = vec![
+        let mut args: Vec<&std::ffi::OsStr> = [
             "--daemon",
             "--bind",
             "127.0.0.1",
@@ -272,10 +307,14 @@ impl<'a> Daemon<'a> {
             "0",
             "--tcp-port",
             "0",
-        ];
+        ]
+        .map(std::ffi::OsStr::new)
+        .to_vec();
         if let Some(mode) = self.isolation {
-            args.push("--session-isolation");
-            args.push(mode);
+            args.extend(["--session-isolation", mode].map(std::ffi::OsStr::new));
+        }
+        if let Some(config) = &self.config {
+            args.extend([std::ffi::OsStr::new("--config"), config.as_os_str()]);
         }
         // Keep the daemon's stderr: when it fails to start, "daemon did not
         // come up" after a twenty-second wait is all the old harness said.
@@ -448,15 +487,122 @@ pub async fn create_and_attach(
         unreachable!("filtered above")
     };
     let pane_id = format!("{}/0", entry.meta.word_id);
-    client
-        .tx
-        .send(ClientMessage::Attach {
-            pane_id: pane_id.clone(),
-            last_seqno: None,
-            size: SIZE,
-        })
-        .expect("send Attach");
+    attach(client, &pane_id, None);
     pane_id
+}
+
+/// Attach `client` to `pane_id`, resuming from `last_seqno` if given.
+pub fn attach(client: &Client, pane_id: &str, last_seqno: Option<SequenceNo>) {
+    let sent = client.tx.send(ClientMessage::Attach {
+        pane_id: pane_id.to_string(),
+        last_seqno,
+        size: SIZE,
+    });
+    assert!(sent.is_ok(), "send Attach");
+}
+
+/// Type `text` into `pane_id` as `client`.
+pub fn type_into(client: &Client, pane_id: &str, text: &str) {
+    let sent = client.tx.send(ClientMessage::PtyInput {
+        pane_id: pane_id.to_string(),
+        data: text.as_bytes().to_vec(),
+    });
+    assert!(sent.is_ok(), "send PtyInput");
+}
+
+// ─── A client's view of one pane ─────────────────────────────────────────────
+
+/// One pane's screen as a client rebuilds it from what the daemon sends, and
+/// how it got there: which snapshots, resets and diffs it applied.
+pub struct Screen {
+    pane_id: String,
+    grid: CellGrid,
+    /// The newest seqno applied: what a client resumes from.
+    pub seqno: Option<SequenceNo>,
+    /// Every `TerminalUpdate` applied, by seqno.
+    pub updates: Vec<SequenceNo>,
+    /// How many `TerminalSnapshot`s were applied.
+    pub snapshots: usize,
+    /// How many `SyncReset`s arrived.
+    pub resets: usize,
+}
+
+impl Screen {
+    #[must_use]
+    pub fn new(pane_id: &str) -> Self {
+        Self {
+            pane_id: pane_id.to_string(),
+            grid: CellGrid::new(SIZE.rows.into(), SIZE.cols.into()),
+            seqno: None,
+            updates: Vec::new(),
+            snapshots: 0,
+            resets: 0,
+        }
+    }
+
+    /// The same screen, with its history of how it got there forgotten: a
+    /// client that comes back with what it last showed.
+    #[must_use]
+    pub fn resumed(&self) -> Self {
+        let mut resumed = Self::new(&self.pane_id);
+        resumed.grid.apply_snapshot(self.grid.to_snapshot());
+        resumed.seqno = self.seqno;
+        resumed
+    }
+
+    /// The grid as one row-major string.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.grid.to_snapshot().cells.iter().map(|c| c.c).collect()
+    }
+
+    /// Apply `msg` if it is for this pane.
+    pub fn apply(&mut self, msg: &ServerMessage) {
+        match msg {
+            ServerMessage::TerminalSnapshot {
+                pane_id,
+                snapshot,
+                seqno,
+                ..
+            } if *pane_id == self.pane_id => {
+                self.grid.apply_snapshot((**snapshot).clone());
+                self.snapshots += 1;
+                self.seqno = Some(*seqno);
+            }
+            ServerMessage::TerminalUpdate {
+                pane_id,
+                diff,
+                seqno,
+                ..
+            } if *pane_id == self.pane_id => {
+                self.grid.apply_diff((**diff).clone());
+                self.updates.push(*seqno);
+                self.seqno = Some(*seqno);
+            }
+            ServerMessage::CursorUpdate {
+                pane_id,
+                cursor,
+                modes,
+                ..
+            } if *pane_id == self.pane_id => self.grid.apply_cursor_update(*cursor, *modes),
+            ServerMessage::SyncReset { pane_id } if *pane_id == self.pane_id => self.resets += 1,
+            _ => {}
+        }
+    }
+
+    /// Apply what `client` receives until the screen shows `text`. Whether it
+    /// does, within [`E2E_TIMEOUT`].
+    pub async fn follow_until(&mut self, client: &mut Client, text: &str) -> bool {
+        let deadline = Instant::now() + E2E_TIMEOUT;
+        while !self.text().contains(text) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, client.rx.recv()).await {
+                Ok(Some(msg)) => self.apply(&msg),
+                Ok(None) | Err(_) => return false,
+            }
+        }
+        true
+    }
 }
 
 // ─── Federation ──────────────────────────────────────────────────────────────
