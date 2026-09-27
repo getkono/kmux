@@ -252,13 +252,16 @@ impl ServerApp {
         {
             let _ = from;
             let mut msg = msg;
+            let request_id =
+                if let kmux_protocol::messages::Federation::Forward { request_id, .. } =
+                    msg.federation()
+                {
+                    request_id.as_deref().copied()
+                } else {
+                    None
+                };
             Err(Refusal {
-                request_id: match msg.federation() {
-                    kmux_protocol::messages::Federation::Forward { request_id, .. } => {
-                        request_id.as_deref().copied()
-                    }
-                    _ => None,
-                },
+                request_id,
                 code: ErrorCode::InternalError,
                 message: "federation is not supported by this daemon yet".to_string(),
             })

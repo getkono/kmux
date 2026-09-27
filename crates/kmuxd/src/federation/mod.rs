@@ -1380,6 +1380,30 @@ mod tests {
         assert_eq!(pane.viewers.len(), 2);
     }
 
+    /// The peer is sent one smallest-wins size, and only when it changes: a
+    /// smaller viewer shrinks the pane, a larger one leaves it.
+    #[tokio::test(start_paused = true)]
+    async fn a_smaller_viewer_resizes_the_pane_upstream_once() {
+        let app = Arc::new(crate::fixtures::fixture_app());
+        let (mut upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let attach = |id: u64, size: TermSize| {
+            let (data_tx, data_rx) = mpsc::channel(8);
+            let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
+            assert!(app.federated_attach("fedlocal/0", ClientId(id), data_tx, ctrl_tx, size));
+            data_rx
+        };
+        let _first = attach(1, sz(24, 80));
+        let _smaller = attach(2, sz(10, 40));
+        let _larger = attach(3, sz(30, 100));
+        let resizes: Vec<TermSize> = std::iter::from_fn(|| upstream.try_recv().ok())
+            .filter_map(|m| match m {
+                ClientMessage::Resize { size, .. } => Some(size),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resizes, vec![sz(10, 40)]);
+    }
+
     #[test]
     fn proxied_pane_mirror_round_trips_for_late_attach() {
         let mut pane = ProxiedPane::new(sz(1, 1));

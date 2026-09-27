@@ -437,35 +437,39 @@ mod tests {
         assert!(broadcasts.try_recv().is_err());
     }
 
-    /// A process overview reply completes its request with local pane ids,
-    /// dropping any pane of a session the hub does not know.
+    /// The hub collects each peer's process overview under an id of its
+    /// own, with local pane ids, dropping any pane of a session it does not
+    /// know.
     #[tokio::test(start_paused = true)]
-    async fn a_process_overview_reply_is_localized_for_its_request() {
+    async fn a_process_overview_is_collected_with_local_pane_ids() {
         let app = Arc::new(fixture_app());
-        let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        Arc::clone(&app.peer_manager.peers.lock().unwrap()["peer:1"])
-            .lock()
-            .unwrap()
-            .pending_overviews
-            .insert(9, tx);
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let collecting = tokio::spawn({
+            let app = Arc::clone(&app);
+            async move { app.peer_manager.collect_process_overview().await }
+        });
+        let request_id = next_upstream(&mut upstream, |m| match m {
+            ClientMessage::ProcessOverview { request_id } => Some(*request_id),
+            _ => None,
+        })
+        .await;
         let pane = |pane_id: String| PaneProcesses {
             pane_id,
             root_pid: Some(1),
             processes: Vec::new(),
         };
         peer.send(ServerMessage::ProcessOverviewResult {
-            request_id: 9,
+            request_id,
             panes: vec![
                 pane(format_pane_id("fedremote", 0)),
                 pane(format_pane_id("unknown", 0)),
             ],
         })
         .unwrap();
-        let panes = tokio::time::timeout(WAIT, rx)
+        let panes = tokio::time::timeout(WAIT, collecting)
             .await
-            .expect("the reply within the bound")
-            .expect("completed");
+            .expect("the overview within the bound")
+            .expect("collected");
         let ids: Vec<_> = panes.into_iter().map(|p| p.pane_id).collect();
         assert_eq!(ids, vec!["fedlocal/0".to_string()]);
     }
