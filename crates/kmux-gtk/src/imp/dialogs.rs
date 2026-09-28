@@ -502,17 +502,14 @@ fn launch_row_widget(
             r
         }
         LaunchRow::ClosedSession {
+            peer,
             name,
             cwd,
             last_active_ms,
             ..
         } => {
-            let when = kmux_app::core::relative_time_label(*last_active_ms);
-            let subtitle = if cwd.is_empty() {
-                when.clone()
-            } else {
-                format!("{cwd} · {when}")
-            };
+            let subtitle =
+                kmux_app::core::closed_session_detail(peer.as_deref(), cwd, *last_active_ms);
             let r = launch_action_row(name, &subtitle, "view-refresh-symbolic", false);
             r.add_suffix(&status_pill(
                 "restore",

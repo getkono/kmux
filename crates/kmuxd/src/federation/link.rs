@@ -317,6 +317,7 @@ pub(super) fn link_down(conn: &Mutex<PeerConnection>) {
     guard.dead = true;
     guard.client_tx = mpsc::unbounded_channel().0;
     guard.pending_overviews.clear();
+    guard.pending_closed.clear();
     super::forward::fail_in_flight(&mut guard);
 }
 

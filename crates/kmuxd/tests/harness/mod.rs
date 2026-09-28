@@ -418,6 +418,11 @@ pub async fn connect_client(sandbox: &Sandbox, token: &str) -> Client {
 
 /// [`connect_client`] against an explicit socket path.
 pub async fn connect_client_at(socket: &Path, token: &str) -> Client {
+    // The harness plays a GUI, and says so as the GUI does: a per-binary
+    // constant, the same value from every test, so no test depends on which
+    // ran first. It makes the client offer what a GUI offers, such as
+    // `session.closed.peer` (issue #228).
+    kmux_client::set_frontend_kind(kmux_protocol::messages::FrontendKind::Gtk);
     let (srv_tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
     let tx = match connect_uds(
         socket,

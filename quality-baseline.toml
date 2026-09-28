@@ -374,11 +374,6 @@ count = 2
 
 [[lints]]
 crate = "kmux-ffi"
-lint = "clippy::too_many_lines"
-count = 1
-
-[[lints]]
-crate = "kmux-ffi"
 lint = "clippy::unwrap_in_result"
 count = 1
 
@@ -475,7 +470,7 @@ count = 2
 [[lints]]
 crate = "kmux-gtk"
 lint = "clippy::redundant_clone"
-count = 12
+count = 11
 
 [[lints]]
 crate = "kmux-gtk"
@@ -820,7 +815,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::unwrap_used"
-count = 92
+count = 90
 
 [[lints]]
 crate = "kmuxd"

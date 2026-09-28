@@ -149,7 +149,7 @@ where
     let auth = ClientMessage::Auth {
         token,
         protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
-        protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
+        protocol_capabilities: kmux_client::tcp_connect::offered_capabilities(FrontendKind::Cli),
         capabilities: ClientCapabilities::default(),
         connection_id: None,
         resume_instance: None,

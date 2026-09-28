@@ -489,10 +489,10 @@ impl AppCore {
                 self.mode = Mode::LaunchPicker;
             }
             LaunchRow::RemoteNewSession { peer } => self.open_remote_new_session(peer),
-            LaunchRow::ClosedSession { word_id, .. } => {
-                // Respawn the closed session; the daemon's SessionCreated reply
-                // selects it (issue #64).
-                self.mgr.restore_session(&word_id);
+            LaunchRow::ClosedSession { peer, word_id, .. } => {
+                // Respawn the closed session where it was closed; the daemon's
+                // SessionCreated reply selects it (issues #64, #228).
+                self.mgr.restore_session(&word_id, peer.as_deref());
                 self.mode = Mode::Normal;
             }
             LaunchRow::AddRemote => self.open_add_remote(),

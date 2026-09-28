@@ -46,6 +46,12 @@ Optional features use stable string capabilities instead. The client offers
 capabilities in `Auth`, and the daemon returns the supported intersection in
 `AuthResult`. A sender must not emit a capability-gated message or codec until
 the peer accepted that capability. The initial capability is `frame.zstd`.
+`session.closed.peer` (issue #228) is the client's promise that it reads
+`ClosedSessionEntry.peer` and names it in `SessionRestore`: a hub sends a
+federated peer's closed sessions only to a client that negotiated it, since
+one that ignores `peer` would restore the peer's word from the hub's own
+graveyard. A reply-shaping capability like this one is how a field whose
+meaning an older reader would get wrong is added without a range bump.
 Unknown capabilities are ignored, not treated as an authentication failure.
 
 Authentication follows this order:

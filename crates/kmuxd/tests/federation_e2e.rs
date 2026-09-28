@@ -471,6 +471,81 @@ async fn await_closed(gui: &mut Client, local_word: &str) -> Vec<String> {
         .collect()
 }
 
+/// A session closed through the hub is restorable through it, as on a local
+/// daemon (issue #228): the hub's closed list shows it under its peer, a
+/// restore naming that peer brings it back under a fresh local word, and a
+/// GUI attaches to it and sees its screen.
+///
+/// Out of process because the graveyard, the restore's respawn and the
+/// session list are the real peer's; the hub's collection and forwarding are
+/// pinned in-memory in `federation::feed` and `federation::forward`.
+#[tokio::test]
+async fn a_peers_closed_session_is_listed_and_restored_through_the_hub() {
+    const MARKER: &str = "FED_RESTORED";
+    let fed = Federation::spawn_pair().await;
+    let pidfile = fed.remote.path().join("restored.pid");
+    create_remote_session(&fed, MARKER, &pidfile).await;
+    let (mut gui, peer_id) = fed.open_peer().await;
+    let listed = hub_list(&mut gui).await;
+    let word = word_named(&listed, MARKER).expect("the hub lists it");
+
+    // Close it through the hub; the peer keeps it in its graveyard.
+    std::fs::remove_file(&pidfile).expect("the first shell's PID file");
+    let close = gui.tx.send(ClientMessage::SessionClose {
+        request_id: 1,
+        word_id: word.clone(),
+    });
+    assert!(close.is_ok(), "send SessionClose to the hub");
+    assert!(!await_closed(&mut gui, &word).await.contains(&word));
+
+    // The hub's closed list has it, under its peer.
+    let list = ClientMessage::SessionListClosed { request_id: 101 };
+    let closed = ask(&mut gui, list, |m| match m {
+        ServerMessage::ClosedSessionListResult {
+            request_id: 101,
+            sessions,
+        } => sessions.iter().find(|e| e.meta.name == MARKER).cloned(),
+        _ => None,
+    })
+    .await;
+    assert_eq!(closed.peer.as_deref(), Some(peer_id.as_str()));
+
+    // Restoring it names the peer, and it comes back under a local word.
+    let restore = ClientMessage::SessionRestore {
+        request_id: 102,
+        word_id: closed.meta.word_id.clone(),
+        peer: closed.peer.clone(),
+    };
+    let entry = ask(&mut gui, restore, |m| match m {
+        ServerMessage::SessionCreated {
+            request_id: 102,
+            entry,
+        } => Some(Ok(entry.clone())),
+        ServerMessage::Error { message, .. } => Some(Err(message.clone())),
+        _ => None,
+    })
+    .await
+    .expect("the peer restores it");
+    let shell = read_pid_file(&pidfile, E2E_TIMEOUT)
+        .await
+        .expect("the restored shell writes its PID");
+    fed.cleanup.track(shell);
+    assert_eq!(entry.peer.as_deref(), Some(peer_id.as_str()));
+    let listed = hub_list(&mut gui).await;
+    assert!(
+        listed.iter().any(|e| e.meta.word_id == entry.meta.word_id),
+        "{listed:?}"
+    );
+
+    // A GUI attaches to it through the hub and sees its screen.
+    let pane = entry.panes[0].pane_id.clone();
+    let screen = snapshot_text(&attach_snapshot(&mut gui, &pane, ATTACH_SIZE).await);
+    assert!(screen.contains(MARKER), "{screen:?}");
+
+    drop(gui);
+    fed.shutdown().await;
+}
+
 /// PR6 hardening: two GUIs federating the **same** remote target concurrently
 /// converge on a single shared upstream link. The reuse check in `open_peer` is
 /// not atomic with the publish across the (slow, awaiting) connect, so both opens

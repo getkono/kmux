@@ -436,15 +436,31 @@ typed error, never answered by a hub that does not host it and never dropped.
   ([architecture-verification.md](architecture-verification.md)); so is an
   upstream `Lagged`.
 
-Not covered: a peer's *closed* sessions (`SessionListClosed`,
-`SessionRestore`) are the hub's own graveyard only (#228).
+- **Closed sessions** (#228) behave as on a local daemon. `SessionListClosed`
+  is answered with the hub's graveyard merged with every reachable peer's,
+  fetched the way `ProcessOverview` is (`PeerManager::collect_closed_sessions`,
+  one request per peer under the hub's own id, `PEER_CLOSED_LIST_TIMEOUT` each;
+  a dead or slow peer contributes nothing). A peer's entry keeps the peer's
+  word and is tagged with its `peer`; entries a peer lists from a peer of its
+  own are dropped (no chained hubs). Peers' entries go only to a client that
+  negotiated `session.closed.peer`: an older GUI would restore a peer's word
+  from the hub's own graveyard. Only a GUI frontend offers it
+  (`kmux-connect`'s `offered_capabilities`): a hub's own link to a peer does
+  not, so a peer that is itself a hub never fans out to its peers while the
+  hub's link waits behind it. `SessionRestore { peer: Some(p) }` is
+  *forwarded* like `SessionCreate { peer }`: the peer restores from its
+  graveyard, and its `SessionCreated` is registered under a fresh local word.
+  The launcher groups a peer's closed sessions after the local ones, one peer
+  at a time, and restores each from where it was closed.
 
 Tests: `federation::forward` (every shape of answer routed back, answers
-without an id to the right sender, refusals, the create, the lock, a dropped
-link), `federation::routes` (runs, barriers, routes), `federation::feed` (events
-broadcast, digest relay and resync), `dispatch::federated` (the router), and
-the E2E `a_proxied_sessions_tabs_and_panes_are_managed_through_the_hub` and
-`a_proxied_panes_history_answers_only_the_client_that_asked`.
+without an id to the right sender, refusals, the create and the restore, the
+lock, a dropped link), `federation::routes` (runs, barriers, routes),
+`federation::feed` (events broadcast, digest relay and resync, the process
+overview and closed-list collections), `dispatch::federated` (the router), and
+the E2E `a_proxied_sessions_tabs_and_panes_are_managed_through_the_hub`,
+`a_proxied_panes_history_answers_only_the_client_that_asked` and
+`a_peers_closed_session_is_listed_and_restored_through_the_hub`.
 
 ## Resolved — federation addressing & testability
 

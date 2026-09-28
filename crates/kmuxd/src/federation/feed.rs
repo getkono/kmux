@@ -8,7 +8,8 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use kmux_protocol::messages::{
-    ClientMessage, PaneProcesses, PeerId, ServerMessage, SessionEntry, SessionEventMsg,
+    ClientMessage, ClosedSessionEntry, PaneProcesses, PeerId, ServerMessage, SessionEntry,
+    SessionEventMsg,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -86,6 +87,13 @@ pub(super) fn on_upstream(
             on_process_overview(conn, request_id, &panes);
             Next::Continue
         }
+        ServerMessage::ClosedSessionListResult {
+            request_id,
+            sessions,
+        } => {
+            on_closed_sessions(conn, peer_id, request_id, sessions);
+            Next::Continue
+        }
         // Any session list is the peer's whole truth: an answer to the hub's
         // own refresh, or the peer's resync after the link lagged.
         ServerMessage::SessionListResult { sessions, .. } => {
@@ -113,6 +121,31 @@ fn on_process_overview(conn: &Mutex<PeerConnection>, request_id: u64, panes: &[P
         drop(guard);
         let _ = tx.send(localized);
     }
+}
+
+/// Route a closed-session list (issue #228) to its waiting collector, each
+/// entry tagged with `peer_id`. An entry the peer lists from a peer of its
+/// own is dropped: this hub could not restore it (chained hubs are not
+/// supported). A list nobody here asked for — a client of the peer's, not
+/// this hub — is dropped.
+fn on_closed_sessions(
+    conn: &Mutex<PeerConnection>,
+    peer_id: &PeerId,
+    request_id: u64,
+    sessions: Vec<ClosedSessionEntry>,
+) {
+    let Some(tx) = lock(conn).pending_closed.remove(&request_id) else {
+        return;
+    };
+    let own: Vec<ClosedSessionEntry> = sessions
+        .into_iter()
+        .filter(|entry| entry.peer.is_none())
+        .map(|entry| ClosedSessionEntry {
+            peer: Some(peer_id.clone()),
+            ..entry
+        })
+        .collect();
+    let _ = tx.send(own);
 }
 
 /// Take in the peer's session list.
@@ -544,6 +577,56 @@ mod tests {
             .expect("collected");
         let ids: Vec<_> = panes.into_iter().map(|p| p.pane_id).collect();
         assert_eq!(ids, vec!["fedlocal/0".to_string()]);
+    }
+
+    /// The hub collects each peer's own closed sessions under an id of its
+    /// own, under the peer's words and tagged with the peer (issue #228). One
+    /// the peer lists from a peer of its own is dropped, and a peer that does
+    /// not answer contributes nothing rather than stalling the list.
+    #[tokio::test(start_paused = true)]
+    async fn a_peers_closed_sessions_are_collected_tagged_with_it() {
+        let app = Arc::new(fixture_app());
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let _silent = app.peer_manager.install_channel_peer(
+            &app,
+            "peer:2",
+            "fedlocal2",
+            "fedremote2",
+            crate::federation::no_reconnect(),
+        );
+        let collecting = tokio::spawn({
+            let app = Arc::clone(&app);
+            async move { app.peer_manager.collect_closed_sessions().await }
+        });
+        let request_id = next_upstream(&mut upstream, |m| match m {
+            ClientMessage::SessionListClosed { request_id } => Some(*request_id),
+            _ => None,
+        })
+        .await;
+        let closed = |word: &str, peer: Option<&str>| ClosedSessionEntry {
+            meta: sample_remote_entry(word).meta,
+            last_active_ms: 1,
+            closed_at_ms: 2,
+            pane_count: 1,
+            peer: peer.map(Into::into),
+        };
+        peer.send(ServerMessage::ClosedSessionListResult {
+            request_id,
+            sessions: vec![closed("kite", None), closed("far", Some("beyond"))],
+        })
+        .unwrap();
+        let sessions = tokio::time::timeout(WAIT, collecting)
+            .await
+            .expect("the list within the bound")
+            .expect("collected");
+        let listed: Vec<(String, Option<String>)> = sessions
+            .into_iter()
+            .map(|e| (e.meta.word_id, e.peer))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("kite".to_string(), Some("peer:1".to_string()))]
+        );
     }
 
     /// Close `fedlocal` from the hub while the peer answers with `said` —

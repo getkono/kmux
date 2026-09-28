@@ -12,8 +12,8 @@
 //! locally-hosted one.
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, ErrorCode, PaneProcesses, PeerId, PeerTarget, RequestId,
-    ServerMessage, SessionEntry, TermSize,
+    ClientId, ClientMessage, ClosedSessionEntry, ErrorCode, PaneProcesses, PeerId, PeerTarget,
+    RequestId, ServerMessage, SessionEntry, TermSize,
 };
 use tokio::sync::mpsc;
 
@@ -212,6 +212,20 @@ impl ServerApp {
         #[cfg(feature = "federation")]
         {
             self.peer_manager.collect_process_overview().await
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Every open peer's own closed sessions (issue #228), each tagged with
+    /// its peer, to be merged into the hub's `ClosedSessionListResult`.
+    /// Empty without the feature.
+    pub async fn collect_federated_closed_sessions(&self) -> Vec<ClosedSessionEntry> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.collect_closed_sessions().await
         }
         #[cfg(not(feature = "federation"))]
         {
