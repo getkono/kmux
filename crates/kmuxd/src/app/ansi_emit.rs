@@ -100,17 +100,42 @@ fn emit_cells(out: &mut Vec<u8>, cells: &[CellState]) {
             prev_style = Some(style);
             out.extend_from_slice(sgr_for(cell).as_bytes());
         }
-        let mut buf = [0u8; 4];
-        out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-        // A wide cell's character may be narrow on its own — the base of a
-        // grapheme a program made wide (VS16 under mode 2027), stored without
-        // the rest — so the next cell is placed by column, not by width.
         if cell.attrs.contains(CellAttrs::WIDE_CHAR) {
+            emit_wide_char(out, cell.c);
+            // Placed by column, not by width: if the emulator does not widen
+            // the character, the rest of the row still lands where it was.
             let _ = write!(out, "\x1b[{}G", col + 3);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
         }
     }
 
     out.extend_from_slice(b"\x1b[0m");
+}
+
+/// Emit the character of a wide cell so that a fresh emulator makes it wide.
+///
+/// A wide cell stores only its grapheme's first codepoint. When that is wide
+/// on its own (CJK, most emoji) writing it is enough. When it is narrow on its
+/// own, a program may have made it wide — `⚠` followed by VS16 under mode 2027
+/// (grapheme clustering) — so a VS16 follows it, under mode 2027 saved and
+/// restored around it (XTSAVE / XTRESTORE; the seed meets a fresh emulator,
+/// where the mode is off, and leaves it off) (issue #236). Only the VS16 is
+/// printed under the mode: a base printed under it could join the cell before
+/// it, as a second regional indicator joins the first into a flag. An emulator
+/// honours VS16 only after an emoji-variation base; any other base ignores it
+/// and stays as wide as the emulator makes it on its own — narrow, for a base
+/// made wide by something other than VS16, which the column placement after it
+/// tolerates.
+fn emit_wide_char(out: &mut Vec<u8>, c: char) {
+    use unicode_width::UnicodeWidthChar as _;
+
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    if c.width() != Some(2) {
+        out.extend_from_slice("\x1b[?2027s\x1b[?2027h\u{fe0f}\x1b[?2027r".as_bytes());
+    }
 }
 
 /// Each attribute and the SGR parameter that sets it.
@@ -313,28 +338,61 @@ mod tests {
         assert_eq!(emitted(text("   ").collect()), "\x1b[0m");
     }
 
+    /// Only a wide cell whose character is narrow on its own gets a VS16
+    /// under mode 2027: a character wide on its own is written as it is,
+    /// costing a CJK screen nothing (issue #236).
+    #[test]
+    fn only_a_narrow_base_in_a_wide_cell_gets_a_vs16() {
+        let wide = |c| {
+            let mut cell = CellState {
+                c,
+                ..CellState::default()
+            };
+            cell.attrs.0 |= CellAttrs::WIDE_CHAR;
+            let mut out = Vec::new();
+            emit_cells(&mut out, &[cell]);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(wide('\u{4e16}'), "\x1b[0m\u{4e16}\x1b[3G\x1b[0m");
+        assert_eq!(
+            wide('\u{26a0}'),
+            "\x1b[0m\u{26a0}\x1b[?2027s\x1b[?2027h\u{fe0f}\x1b[?2027r\x1b[3G\x1b[0m"
+        );
+    }
+
     /// A wide cell whose stored character is narrow on its own — a grapheme
-    /// made wide by VS16 under mode 2027, stored as its base — leaves the rest
-    /// of the row where it was (issue #234).
+    /// made wide by VS16 under mode 2027, stored as its base — is seeded wide
+    /// again, cell for cell, and the rest of the row stays where it was
+    /// (issues #234, #236). So are flags — two wide regional indicators with
+    /// the mode off, one cluster with it on — which must not join a
+    /// neighbour. The seed leaves mode 2027 off, as it found it: a VS16
+    /// printed afterwards makes nothing wide.
     #[test]
     fn a_grapheme_made_wide_keeps_the_rest_of_its_row_in_place() {
-        let before = fixture_term_state(1, 10);
-        lock_term_state(&before).feed("\x1b[?2027h\u{26a0}\u{fe0f}after".as_bytes());
+        let vs16_warning = "\u{26a0}\u{fe0f}";
+        let flag = "\u{1f1fa}\u{1f1f8}";
+        let before = fixture_term_state(2, 12);
+        lock_term_state(&before)
+            .feed(format!("{flag}x\r\n\x1b[?2027h{vs16_warning}after{flag}\x1b[?2027l").as_bytes());
         let snapshot = lock_term_state(&before).snapshot();
         assert!(
-            snapshot.cells[0].attrs.contains(CellAttrs::WIDE_CHAR),
-            "the emulator made it wide"
+            snapshot.cells[12].attrs.contains(CellAttrs::WIDE_CHAR),
+            "the emulator made the warning sign wide"
         );
 
-        let after = fixture_term_state(1, 10);
+        let after = fixture_term_state(2, 12);
         let preamble = snapshot_to_ansi(&snapshot, &[], false);
         let diffs = Arc::new(Mutex::new(DiffBuffer::new(64 * 1024)));
         seed_pane_with_preamble(&after, &diffs, &Arc::new(AtomicU64::new(1)), &preamble);
         let seeded = lock_term_state(&after).snapshot();
 
-        let text = |s: &GridSnapshot| s.cells[2..7].iter().map(|c| c.c).collect::<String>();
-        assert_eq!(text(&seeded), text(&snapshot));
-        assert_eq!(text(&seeded), "after");
+        assert_eq!(seeded.cells, snapshot.cells, "the rows, cell for cell");
+        lock_term_state(&after).feed(format!("\x1b[2;10H{vs16_warning}").as_bytes());
+        let later = lock_term_state(&after).snapshot();
+        assert!(
+            !later.cells[12 + 9].attrs.contains(CellAttrs::WIDE_CHAR),
+            "mode 2027 is off again"
+        );
     }
 
     /// Every line in `term`'s history, oldest first.
