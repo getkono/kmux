@@ -177,7 +177,7 @@ rows 2026-09-27 (issue #211):
 | R3/R13 — no test-only lock | 98 sites / 10 files | **0 / 0** | 0 — reached |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 34 by the audit snippet (largest 417, `async_main`, a registered exception) | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
-| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | **a budget per crate**, from the first complete sweep (2,881 missed, most in `kmux-gtk`, `kmux-app`, `kmux-render` and `kmuxd`) | budgets that only shrink |
+| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | **a budget per crate**, from complete sweeps (2,881 budgeted: run 36350757325's 2,886 less the five `CellAttrs::contains` mutants since killed; most in `kmux-gtk`, `kmux-app`, `kmux-render` and `kmuxd`) | budgets that only shrink |
 
 Every case reached zero the same way — take the thing the test needs to vary and
 make it a parameter:
@@ -223,7 +223,7 @@ ran, while the judge merged the other seven as if they were everything. The
 shards now run 0-7 and the judge refuses a sweep unless all eight finished. The
 `[[mutants]]` budgets were recorded from the first complete ones: run
 36339914509, before the suite's #211 de-duplication, and run 36350757325 after
-it, which is what the rows hold. The second is also how the de-duplication was
+it, which is what every row but `kmux-protocol` holds. The second is also how the de-duplication was
 checked. It was meant to delete only tests another test pins, and the sweep
 found where that was not so: five `CellAttrs::contains` mutants that a
 deleted round-trip test had killed now survived, so that function has a test of
