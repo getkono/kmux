@@ -53,6 +53,9 @@ jobs:
           install: true
           cache: true
 
+      # A key of its own (issue #234): a sweep that missed the cache saved its
+      # `target/` under the key every CI job restores, and what a sweep leaves
+      # there is not what those jobs build. It still warm-starts from theirs.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -60,7 +63,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-mutants-
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache zig build artefacts
         uses: actions/cache@v4
