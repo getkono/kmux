@@ -80,7 +80,7 @@ fn auth_message(
 /// `session.closed.peer` (issue #228). A CLI never lists closed sessions, and
 /// a federation hub's link to its peer must not make that peer, when it is a
 /// hub too, fan out to its own peers while the hub's link waits behind it.
-fn offered_capabilities(client_kind: FrontendKind) -> Vec<String> {
+pub fn offered_capabilities(client_kind: FrontendKind) -> Vec<String> {
     let gui = matches!(client_kind, FrontendKind::Gtk | FrontendKind::Swift);
     kmux_protocol::messages::protocol_capabilities()
         .into_iter()
@@ -473,5 +473,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn auth_offers_what_this_process_kind_offers() {
+        // This test binary never declares a kind, so it runs as the CLI (and as
+        // a federation hub's link does): no `session.closed.peer` (issue #228).
+        let offered = match auth_message("tok".into(), ClientCapabilities::default(), None, claim())
+        {
+            ClientMessage::Auth {
+                protocol_capabilities,
+                ..
+            } => Some(protocol_capabilities),
+            _ => None,
+        };
+        assert_eq!(offered, Some(offered_capabilities(FrontendKind::Cli)));
     }
 }
