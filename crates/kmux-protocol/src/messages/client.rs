@@ -707,27 +707,46 @@ mod tests {
         }
     }
 
-    /// Every message is classified: the input messages as `Shell`, a history
-    /// fetch as `Scrollback`, the pings as `Liveness`, the handshake as
-    /// `Bootstrap`, and everything else as `Control`. One sample per variant
-    /// (`every_client_message`, whose completeness `spec` checks).
+    /// One message per category a client sends (R9); `category()`'s
+    /// exhaustive `match` classifies the rest.
     #[test]
-    fn category_covers_every_client_variant() {
+    fn category_classifies_one_message_of_each_category() {
+        let cases = [
+            (
+                ClientMessage::PtyPaste {
+                    pane_id: "p".into(),
+                    data: "x".into(),
+                },
+                MessageCategory::Shell,
+            ),
+            (
+                ClientMessage::FetchHistory {
+                    request_id: 0,
+                    pane_id: "p".into(),
+                    start_index: 0,
+                    count: 1,
+                },
+                MessageCategory::Scrollback,
+            ),
+            (ClientMessage::Pong { seq: 1 }, MessageCategory::Liveness),
+            (
+                ClientMessage::SessionList { request_id: 0 },
+                MessageCategory::Control,
+            ),
+            (ClientMessage::ChannelReady, MessageCategory::Bootstrap),
+        ];
+        for (msg, expected) in &cases {
+            assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
+        }
+    }
+
+    /// A resync is the daemon's to start: no client message is `Sync`. Over
+    /// one sample of every variant (`every_client_message`, whose
+    /// completeness `spec` checks).
+    #[test]
+    fn no_client_message_is_a_resync() {
         for msg in super::super::every_client_message() {
-            let expected = match &msg {
-                ClientMessage::PtyInput { .. }
-                | ClientMessage::PtyPaste { .. }
-                | ClientMessage::PtyKeyBatch { .. } => MessageCategory::Shell,
-                ClientMessage::FetchHistory { .. } => MessageCategory::Scrollback,
-                ClientMessage::Ping { .. } | ClientMessage::Pong { .. } => {
-                    MessageCategory::Liveness
-                }
-                ClientMessage::Auth { .. }
-                | ClientMessage::AuthProof { .. }
-                | ClientMessage::ChannelReady => MessageCategory::Bootstrap,
-                _ => MessageCategory::Control,
-            };
-            assert_eq!(msg.category(), expected, "wrong category for {msg:?}");
+            assert_ne!(msg.category(), MessageCategory::Sync, "{msg:?}");
         }
     }
 

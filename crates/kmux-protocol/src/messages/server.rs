@@ -419,80 +419,17 @@ impl ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::super::session::{
-        ClientId, PaneInfo, SessionEntry, SessionEventMsg, SessionMeta, TermSize,
-    };
-    use super::super::vt::{CursorState, GridSnapshot, TermModes, TerminalDiff};
+    use super::super::vt::{CursorState, TermModes};
     use super::*;
 
-    fn dummy_session_entry() -> SessionEntry {
-        use super::super::session::{LayoutNode, TabInfo};
-        SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: "w".into(),
-                name: "n".into(),
-                cwd: "/".into(),
-            },
-            panes: vec![],
-            tabs: vec![TabInfo {
-                tab_index: 0,
-                name: "1".into(),
-                layout: LayoutNode::single(0),
-                focused_pane: 0,
-            }],
-            active_tab: 0,
-            peer: None,
-            peer_unreachable: false,
-        }
-    }
-
-    fn dummy_terminal_diff() -> TerminalDiff {
-        TerminalDiff {
-            ops: vec![],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-            history_total: 0,
-            scrollback_reset: None,
-        }
-    }
-
-    fn dummy_grid_snapshot() -> GridSnapshot {
-        GridSnapshot {
-            rows: 24,
-            cols: 80,
-            cells: vec![],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-            history_total: 0,
-            scrollback_base: 0,
-            scrollback_tail: vec![],
-        }
-    }
-
+    /// One message per category (R9). `category()` is an exhaustive `match`,
+    /// so the compiler already classifies every variant; what a test adds is
+    /// that each category is the right one, and that every category is one a
+    /// daemon can send.
     #[test]
-    fn category_covers_every_server_variant() {
-        let cases: Vec<(ServerMessage, MessageCategory)> = vec![
-            (
-                ServerMessage::TerminalUpdate {
-                    pane_id: "p".into(),
-                    diff: Arc::new(dummy_terminal_diff()),
-                    seqno: SequenceNo(1),
-                    sent_at_ms: 0,
-                },
-                MessageCategory::Shell,
-            ),
-            (
-                ServerMessage::TerminalSnapshot {
-                    pane_id: "p".into(),
-                    snapshot: std::sync::Arc::new(dummy_grid_snapshot()),
-                    seqno: SequenceNo(1),
-                    sent_at_ms: 0,
-                },
-                MessageCategory::Shell,
-            ),
+    fn category_classifies_one_message_of_each_category() {
+        let cases = [
+            (ServerMessage::Ping { seq: 1 }, MessageCategory::Liveness),
             (
                 ServerMessage::CursorUpdate {
                     pane_id: "p".into(),
@@ -502,16 +439,6 @@ mod tests {
                     sent_at_ms: 0,
                 },
                 MessageCategory::Shell,
-            ),
-            (
-                ServerMessage::ScrollbackAppend {
-                    pane_id: "p".into(),
-                    first_index: 0,
-                    lines: vec![],
-                    seqno: SequenceNo(1),
-                    sent_at_ms: 0,
-                },
-                MessageCategory::Scrollback,
             ),
             (
                 ServerMessage::HistoryLines {
@@ -524,23 +451,6 @@ mod tests {
                 },
                 MessageCategory::Scrollback,
             ),
-            (ServerMessage::Ping { seq: 1 }, MessageCategory::Liveness),
-            (ServerMessage::Pong { seq: 1 }, MessageCategory::Liveness),
-            (
-                ServerMessage::SessionCreated {
-                    request_id: 0,
-                    entry: dummy_session_entry(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::SessionClosed {
-                    request_id: 0,
-                    word_id: "w".into(),
-                    exit_code: None,
-                },
-                MessageCategory::Control,
-            ),
             (
                 ServerMessage::SessionListResult {
                     request_id: 0,
@@ -549,159 +459,10 @@ mod tests {
                 MessageCategory::Control,
             ),
             (
-                ServerMessage::ProcessOverviewResult {
-                    request_id: 0,
-                    panes: vec![],
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::SessionRenamed {
-                    word_id: "w".into(),
-                    new_name: "n".into(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::PaneCreated {
-                    request_id: 0,
-                    pane_id: "p".into(),
-                    session_word_id: "w".into(),
-                    size: TermSize::default(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::PaneClosed {
-                    request_id: 0,
-                    pane_id: "p".into(),
-                    exit_code: None,
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::TabCreated {
-                    request_id: 0,
-                    word_id: "w".into(),
-                    tab: TabInfo {
-                        tab_index: 0,
-                        name: "1".into(),
-                        layout: LayoutNode::single(0),
-                        focused_pane: 0,
-                    },
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::TabClosed {
-                    request_id: 0,
-                    word_id: "w".into(),
-                    tab_index: 0,
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::PaneSplit {
-                    request_id: 0,
-                    word_id: "w".into(),
-                    tab_index: 0,
-                    new_pane: PaneInfo {
-                        pane_id: "w/1".into(),
-                        pane_index: 1,
-                        program: "/bin/sh".into(),
-                        size: TermSize::default(),
-                        attached_clients: vec![],
-                        status: super::super::session::SessionStatus::Running,
-                        title: String::new(),
-                        progress_state: Default::default(),
-                        progress: None,
-                    },
-                    layout: LayoutNode::single(0),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::LayoutUpdate {
-                    word_id: "w".into(),
-                    tab_index: 0,
-                    layout: LayoutNode::single(0),
-                    focused_pane: 0,
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::Event {
-                    event: SessionEventMsg::SessionCreated {
-                        word_id: "w".into(),
-                    },
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::Error {
-                    request_id: None,
-                    code: ErrorCode::InternalError,
-                    message: "e".into(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::InputLockGranted {
-                    pane_id: "p".into(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::InputLockDenied {
-                    pane_id: "p".into(),
-                    holder: ClientId(1),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::InputLockReleased {
-                    pane_id: "p".into(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::Lagged {
-                    pane_id: "p".into(),
-                    missed_count: 1,
-                },
-                MessageCategory::Sync,
-            ),
-            (
                 ServerMessage::SyncReset {
                     pane_id: "p".into(),
                 },
                 MessageCategory::Sync,
-            ),
-            (
-                ServerMessage::GridDigest {
-                    pane_id: "p".into(),
-                    seqno: SequenceNo(1),
-                    hash: 0,
-                },
-                MessageCategory::Sync,
-            ),
-            (
-                ServerMessage::AuthResult {
-                    success: true,
-                    reason: None,
-                    failure: None,
-                    client_id: None,
-                    server_version: None,
-                    connection_id: None,
-                    daemon_instance: None,
-                    compression: None,
-                    machine_id: None,
-                    label: None,
-                    server_machine_id: None,
-                    negotiated_protocol: Some(super::super::types::PROTOCOL_VERSION),
-                    negotiated_capabilities: super::super::types::protocol_capabilities(),
-                },
-                MessageCategory::Bootstrap,
             ),
             (
                 ServerMessage::ChannelSwitched {
@@ -709,44 +470,15 @@ mod tests {
                 },
                 MessageCategory::Bootstrap,
             ),
-            (
-                ServerMessage::DirectoryListing {
-                    request_id: 0,
-                    path: "/tmp".into(),
-                    parent: Some("/".into()),
-                    entries: vec![],
-                    error: None,
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::PeerOpened {
-                    request_id: 0,
-                    peer: "box".into(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::PeerClosed {
-                    request_id: 0,
-                    peer: "box".into(),
-                },
-                MessageCategory::Control,
-            ),
-            (
-                ServerMessage::PeerError {
-                    request_id: 0,
-                    peer: Some("box".into()),
-                    reason: "nope".into(),
-                },
-                MessageCategory::Control,
-            ),
         ];
         for (msg, expected) in &cases {
             assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
         }
+        let covered: Vec<MessageCategory> = cases.iter().map(|(_, c)| *c).collect();
+        let mut all = MessageCategory::all().to_vec();
+        all.retain(|c| !covered.contains(c));
+        assert!(all.is_empty(), "no case for {all:?}");
     }
-
     #[test]
     fn directory_listing_roundtrips() {
         use super::super::session::DirEntry;

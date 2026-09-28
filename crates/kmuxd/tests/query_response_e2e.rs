@@ -17,59 +17,7 @@
 
 mod harness;
 
-use std::time::{Duration, Instant};
-
-use harness::{
-    Cleanup, Client, Daemon, SIZE, Sandbox, connect_client, create_and_attach, daemon_token,
-};
-use kmux_client::grid::CellGrid;
-use kmux_protocol::messages::ServerMessage;
-
-/// Reconstruct the pane's grid from the daemon's messages into one flat string,
-/// applying updates until `pred` matches the accumulated text or `timeout`.
-async fn grid_text_until(
-    client: &mut Client,
-    pane_id: &str,
-    timeout: Duration,
-    pred: impl Fn(&str) -> bool,
-) -> String {
-    let mut grid = CellGrid::new(SIZE.rows as usize, SIZE.cols as usize);
-    let deadline = Instant::now() + timeout;
-    loop {
-        let text: String = grid.to_snapshot().cells.iter().map(|c| c.c).collect();
-        if pred(&text) {
-            return text;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return text;
-        }
-        let Ok(Some(msg)) = tokio::time::timeout(remaining, client.rx.recv()).await else {
-            return grid.to_snapshot().cells.iter().map(|c| c.c).collect();
-        };
-        match msg {
-            ServerMessage::TerminalSnapshot {
-                pane_id: p,
-                snapshot,
-                ..
-            } if p == pane_id => {
-                grid.apply_snapshot((*snapshot).clone());
-            }
-            ServerMessage::TerminalUpdate {
-                pane_id: p, diff, ..
-            } if p == pane_id => {
-                grid.apply_diff((*diff).clone());
-            }
-            ServerMessage::CursorUpdate {
-                pane_id: p,
-                cursor,
-                modes,
-                ..
-            } if p == pane_id => grid.apply_cursor_update(cursor, modes),
-            _ => {}
-        }
-    }
-}
+use harness::{Cleanup, Daemon, Sandbox, Screen, connect_client, create_and_attach, daemon_token};
 
 /// The DSR cursor-position round-trip: the child emits `CSI 6 n`, reads the
 /// 6-byte reply the daemon writes back, and echoes it via `cat -v` as `^[[1;1R`.
@@ -80,7 +28,7 @@ async fn assert_dsr_roundtrip(isolated: bool) {
 
     let daemon = Daemon::new(&sandbox);
     let daemon = if isolated { daemon.isolated() } else { daemon };
-    cleanup.track(daemon.spawn(None).await as i32);
+    cleanup.track(daemon.spawn(None).await.cast_signed());
 
     let token = daemon_token(&sandbox).await;
     let mut client = connect_client(&sandbox, &token).await;
@@ -92,16 +40,14 @@ async fn assert_dsr_roundtrip(isolated: bool) {
     )
     .await;
 
-    let text = grid_text_until(&mut client, &pane, harness::E2E_TIMEOUT, |t| {
-        t.contains("[1;1R")
-    })
-    .await;
-
+    let mut screen = Screen::new(&pane);
     assert!(
-        text.contains("[1;1R"),
+        screen.follow_until(&mut client, "[1;1R").await,
         "the DSR cursor-position reply must round-trip back to the child and \
-         render (looked for `^[[1;1R` via `cat -v`); grid was: {:?}",
-        text.trim_end()
+         render (looked for `^[[1;1R` via `cat -v`); grid was {:?}, and the \
+         daemon logged:\n{}",
+        screen.text().trim_end(),
+        sandbox.daemon_log()
     );
 }
 

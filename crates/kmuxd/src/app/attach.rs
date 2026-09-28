@@ -316,9 +316,71 @@ impl ServerApp {
 #[cfg(test)]
 mod tests {
     use kmux_protocol::format_pane_id;
-    use kmux_protocol::messages::{ClientCapabilities, TermSize};
+    use kmux_protocol::messages::{ClientCapabilities, SequenceNo, TermSize};
 
+    use super::super::fixtures::{fixture_relay, push_seqnos};
+    use super::{AttachResult, MAX_RESUME_DELTA_DIFFS, compute_replay};
     use crate::fixtures::fixture_app;
+
+    /// What an attach is sent, reduced to what tells the cases apart.
+    #[derive(Debug, PartialEq)]
+    enum Replay {
+        Snapshot,
+        Diffs(Vec<u64>),
+        Reset(u64),
+    }
+
+    /// Which catch-up an attach gets, by the seqno the client last applied
+    /// (`None`: a fresh attach) against the diffs the pane keeps.
+    #[tokio::test]
+    async fn an_attach_is_sent_a_snapshot_the_missed_diffs_or_a_reset() {
+        let too_many = MAX_RESUME_DELTA_DIFFS as u64 + 50;
+        let cases = [
+            ("a fresh attach", 1..=5, None, Replay::Snapshot),
+            (
+                "the missed diffs",
+                1..=5,
+                Some(1),
+                Replay::Diffs(vec![2, 3, 4, 5]),
+            ),
+            (
+                "in step: nothing missed",
+                1..=5,
+                Some(5),
+                Replay::Diffs(vec![]),
+            ),
+            // Issued by another daemon run: a delta from it would be empty
+            // and leave the client showing that run's screen.
+            (
+                "a seqno this pane never reached",
+                1..=5,
+                Some(6),
+                Replay::Reset(5),
+            ),
+            (
+                "older than the diffs kept",
+                3..=5,
+                Some(1),
+                Replay::Reset(5),
+            ),
+            (
+                "more than is worth replaying",
+                1..=too_many,
+                Some(1),
+                Replay::Reset(too_many),
+            ),
+        ];
+        for (case, kept, last, expected) in cases {
+            let relay = fixture_relay(24, 80);
+            push_seqnos(&relay, kept);
+            let replay = match compute_replay(&relay, last.map(SequenceNo)) {
+                AttachResult::FullSnapshot(..) => Replay::Snapshot,
+                AttachResult::Delta(diffs) => Replay::Diffs(diffs.iter().map(|d| d.0.0).collect()),
+                AttachResult::SyncReset(_, seqno) => Replay::Reset(seqno.0),
+            };
+            assert_eq!(replay, expected, "{case}");
+        }
+    }
 
     /// A lagged pane stream resyncs from a snapshot of the hosted pane at its
     /// current size; a pane this daemon does not host has none.

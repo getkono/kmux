@@ -1,141 +1,117 @@
 //! Cross-process integration test for session process isolation (issue #126).
 //!
 //! Spawns a *real* `kmuxd` with `--session-isolation process`, so each pane's
-//! VT pipeline runs in an isolated `kmux-vt-worker` subprocess. It then kills a
-//! worker abnormally (standing in for a libghostty-vt SIGSEGV) and asserts the
-//! headline invariant of #126: **the daemon survives**, the crashed pane
-//! surfaces a `PaneFaulted` to its client, and a fresh session still works.
+//! VT pipeline runs in an isolated `kmux-vt-worker` subprocess, and kills
+//! workers abnormally (standing in for a libghostty-vt SIGSEGV). A worker is a
+//! real process, which is why this cannot run in-process; the restart budget's
+//! windowing is unit-tested on its own in `app/recover.rs`.
 
 #![cfg(unix)]
 
 mod harness;
 
-use std::process::Command;
-use std::time::{Duration, Instant};
-
 use harness::{
-    Cleanup, Daemon, Sandbox, connect_client, create_and_attach, daemon_token, pid_alive,
-    recv_until,
+    Cleanup, Client, Daemon, E2E_TIMEOUT, Sandbox, connect_client, create_and_attach, daemon_token,
+    recv_until, wait_for,
 };
+use kmux_protocol::control_rpc::WorkerInfo;
 use kmux_protocol::messages::{ServerMessage, SessionEventMsg};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-/// Find the worker subprocess that is a child of `daemon_pid`.
-fn find_worker_pid(daemon_pid: u32, timeout: Duration) -> Option<i32> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(out) = Command::new("pgrep")
-            .args(["-P", &daemon_pid.to_string(), "kmux-vt-worker"])
-            .output()
-            && let Some(pid) = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .next()
-                .and_then(|l| l.trim().parse::<i32>().ok())
-        {
-            return Some(pid);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+/// How many times a crashed worker is respawned within its window:
+/// `kmuxd::app::recover::MAX_RESTARTS`.
+const MAX_RESTARTS: usize = 3;
+
+/// The daemon's report on `pane`'s worker, once it names a worker other than
+/// `not`: a respawn, or the first worker when `not` is 0.
+async fn worker_of(sandbox: &Sandbox, pane: &str, not: u32) -> Option<WorkerInfo> {
+    wait_for(E2E_TIMEOUT, || async {
+        kmux_client::daemon::query_workers_at(&sandbox.socket_path())
+            .await
+            .ok()?
+            .workers
+            .into_iter()
+            .find(|w| w.pane_id == pane && w.worker_pid != not)
+    })
+    .await
 }
 
-/// A worker SIGSEGV (here a SIGKILL standing in for any abnormal death) faults
-/// only its own pane: the client is told `PaneFaulted`, the daemon stays alive,
-/// and a brand-new session still works. This is the acceptance test for #126.
+/// Kill `worker` as a crash would, and wait for `client` to be told its pane
+/// faulted.
+async fn crash(worker: &WorkerInfo, client: &mut Client) {
+    let pid = Pid::from_raw(worker.worker_pid.cast_signed());
+    kill(pid, Signal::SIGKILL).expect("kill the worker");
+    let faulted = recv_until(&mut client.rx, E2E_TIMEOUT, |m| {
+        matches!(m, ServerMessage::Event { event: SessionEventMsg::PaneFaulted { pane_id } }
+            if *pane_id == worker.pane_id)
+    })
+    .await;
+    assert!(faulted.is_some(), "{} did not fault", worker.pane_id);
+}
+
+/// A snapshot of `pane` reaches `client`: an attach, or a resync.
+async fn snapshot_of(client: &mut Client, pane: &str) -> bool {
+    recv_until(
+        &mut client.rx,
+        E2E_TIMEOUT,
+        |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if pane_id == pane),
+    )
+    .await
+    .is_some()
+}
+
+/// A crashed worker faults only its own pane: the daemon lives on, respawns
+/// the worker and resyncs the pane's client — up to [`MAX_RESTARTS`] times.
+/// Past that the pane is left faulted, while another pane's worker still
+/// recovers. This is the acceptance test for #126.
 #[tokio::test]
-async fn worker_crash_is_isolated_from_the_daemon() {
+async fn a_crashing_worker_is_respawned_up_to_its_budget_then_left_faulted() {
     let sandbox = Sandbox::new();
     let cleanup = Cleanup::default();
     let daemon_pid = Daemon::new(&sandbox).isolated().spawn(None).await;
-    cleanup.track(daemon_pid as i32);
-
+    cleanup.track(daemon_pid.cast_signed());
     let token = daemon_token(&sandbox).await;
-
-    // Session A, running in an isolated worker; keep the client attached.
     let mut client = connect_client(&sandbox, &token).await;
-    let pane_a = create_and_attach(&mut client, 1, None).await;
-    // The attach replays a snapshot minted from the daemon-side mirror, proving
-    // the worker pane is live end-to-end through the daemon.
-    let snap = recv_until(
-        &mut client.rx,
-        harness::E2E_TIMEOUT,
-        |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_a),
-    )
-    .await;
-    assert!(
-        snap.is_some(),
-        "attach should replay a snapshot for the worker pane"
-    );
+    let pane = create_and_attach(&mut client, 1, None).await;
+    assert!(snapshot_of(&mut client, &pane).await, "attached");
 
-    // Find and abnormally kill the pane's worker.
-    let worker_pid = find_worker_pid(daemon_pid, harness::E2E_TIMEOUT)
-        .expect("the isolated worker subprocess should be running");
-    cleanup.track(worker_pid);
-    assert!(
-        pid_alive(worker_pid),
-        "worker should be alive before the kill"
-    );
-    kill(Pid::from_raw(worker_pid), Signal::SIGKILL).expect("kill worker");
-
-    // The client is told its pane faulted (not that the daemon died).
-    let faulted = recv_until(&mut client.rx, harness::E2E_TIMEOUT, |m| {
-        matches!(
-            m,
-            ServerMessage::Event {
-                event: SessionEventMsg::PaneFaulted { pane_id }
-            } if *pane_id == pane_a
-        )
-    })
-    .await;
-    assert!(
-        faulted.is_some(),
-        "the crashed pane should surface PaneFaulted to its client"
-    );
-
-    // Self-healing: the shell is still alive, so the daemon respawns the worker
-    // and resyncs the client to the fresh emulator with a snapshot.
-    let resync = recv_until(
-        &mut client.rx,
-        harness::E2E_TIMEOUT,
-        |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_a),
-    )
-    .await;
-    assert!(
-        resync.is_some(),
-        "the faulted pane should respawn its worker and resync the client"
-    );
-    assert!(
-        find_worker_pid(daemon_pid, harness::E2E_TIMEOUT).is_some(),
-        "a replacement worker should be running for the recovered pane"
-    );
-
-    // Headline: the daemon is still alive and responsive.
-    assert!(
-        pid_alive(daemon_pid as i32),
-        "daemon must survive a worker crash"
-    );
-    let status = kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
-        .await
-        .expect("daemon should still answer the control socket");
-    assert_eq!(status.pid, daemon_pid, "same daemon, still serving");
-
-    // And a brand-new isolated session still works after the crash.
-    let mut client_b = connect_client(&sandbox, &token).await;
-    let pane_b = create_and_attach(&mut client_b, 2, None).await;
-    let snap_b = recv_until(
-        &mut client_b.rx,
-        harness::E2E_TIMEOUT,
-        |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_b),
-    )
-    .await;
-    assert!(
-        snap_b.is_some(),
-        "a fresh isolated session must work after another worker crashed"
-    );
-    if let Some(b) = find_worker_pid(daemon_pid, harness::E2E_TIMEOUT) {
-        cleanup.track(b);
+    let mut worker = worker_of(&sandbox, &pane, 0).await.expect("a worker");
+    for respawns in 1..=MAX_RESTARTS {
+        cleanup.track(worker.worker_pid.cast_signed());
+        crash(&worker, &mut client).await;
+        worker = worker_of(&sandbox, &pane, worker.worker_pid)
+            .await
+            .unwrap_or_else(|| panic!("respawn {respawns}:\n{}", sandbox.daemon_log()));
+        assert_eq!(worker.restart_count, respawns);
+        assert!(snapshot_of(&mut client, &pane).await, "resync {respawns}");
     }
+    assert!(!worker.within_restart_budget);
+    crash(&worker, &mut client).await;
+
+    // Faults are handled one at a time, in order, so once a crash in another
+    // pane has been answered with a respawn, this one's has been decided.
+    let mut other = connect_client(&sandbox, &token).await;
+    let other_pane = create_and_attach(&mut other, 2, None).await;
+    assert!(snapshot_of(&mut other, &other_pane).await, "attached");
+    let other_worker = worker_of(&sandbox, &other_pane, 0).await.expect("a worker");
+    cleanup.track(other_worker.worker_pid.cast_signed());
+    crash(&other_worker, &mut other).await;
+    let respawned = worker_of(&sandbox, &other_pane, other_worker.worker_pid)
+        .await
+        .expect("the other pane recovers");
+    cleanup.track(respawned.worker_pid.cast_signed());
+
+    let left = worker_of(&sandbox, &pane, 0).await.expect("still listed");
+    assert_eq!(
+        (left.worker_pid, left.restart_count),
+        (worker.worker_pid, MAX_RESTARTS),
+        "no respawn past the budget"
+    );
+    let status = kmux_client::daemon::query_daemon_at(&sandbox.socket_path()).await;
+    assert_eq!(
+        status.map(|s| s.pid),
+        Some(daemon_pid),
+        "the daemon survives"
+    );
 }

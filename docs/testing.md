@@ -168,15 +168,16 @@ The tree does not satisfy every rule above yet. That is stated here rather than
 left implicit, because a normative document whose rules are quietly violated is
 the problem this one exists to fix.
 
-Measured 2026-08-22; the R3 row updated 2026-09-25 (issue #204):
+Measured 2026-08-22; the R3 row updated 2026-09-25 (issue #204), the R4 and R12
+rows 2026-09-27 (issue #211):
 
 | Rule | At branch start | Now | Target |
 | --- | --- | --- | --- |
 | R3 — no process-global env mutation | 91 sites / 13 files | **0 / 0** | 0 — reached |
 | R3/R13 — no test-only lock | 98 sites / 10 files | **0 / 0** | 0 — reached |
-| R4 — no function over 100 lines | 45 (largest 888 lines) | 45 (largest 394, a registered exception) | 0, minus the exceptions register |
+| R4 — no function over 100 lines | 45 (largest 888 lines) | 34 by the audit snippet (largest 417, `async_main`, a registered exception) | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
-| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
+| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; the first weekly sweep ran 7 of its 8 shards, so **no complete sweep yet** | a recorded `[[mutants]]` budget per crate |
 
 Every case reached zero the same way — take the thing the test needs to vary and
 make it a parameter:
@@ -215,13 +216,17 @@ actually a proxy for — logic per function. `handle_server_message` went from
 mutants that stand for "this message does nothing" went from 2 to 104.
 
 R12 is the one row that is not yet a number. The scoring bug is fixed and the
-believability check is in place, but a full sweep takes hours and none has run
-since, so `[[mutants]]` is empty and the per-PR CI job mutates only the diff —
-which needs no baseline, because its scope *is* the change under review, and
-which `mutants-gate --diff` holds to zero survivors whatever the table later
-records. The
-weekly sweep is what fills the table in. Recording the June numbers instead
-would have been worse than recording nothing.
+believability check is in place. The first scheduled sweep (2026-09-27) was
+believable but not whole: its shards were numbered 1-8 where cargo-mutants
+counts from 0, so shard 8/8 refused to start and shard 0/8 — an eighth of the
+mutants — never ran, while the judge merged the other seven as if they were
+everything. Budgets read off it would be too tight by whatever that eighth
+misses, so `[[mutants]]` stays empty; the shards now run 0-7, and the judge
+refuses a sweep with fewer than eight. Meanwhile the per-PR CI job mutates only
+the diff — which needs no baseline, because its scope *is* the change under
+review, and which `mutants-gate --diff` holds to zero survivors whatever the
+table later records. The weekly sweep is what fills the table in. Recording the
+June numbers instead would have been worse than recording nothing.
 
 These are budgets, not aspirations: each one is recorded in
 `quality-baseline.toml` and may only shrink. CI fails both when a count rises
@@ -243,22 +248,22 @@ Every tier above *pure* states in a comment why the tier below cannot cover it
 
 ## Per crate
 
-Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
+Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-09-27.
 
 | Crate | Unit | Integ | What is tested | Doubles & seams | Not tested (→ exceptions) |
 | --- | --- | --- | --- | --- | --- |
-| `kmux-protocol` | 124 | — | codec byte fixtures, framing, version/capability negotiation, message categories, compat classification; the control socket's `ControlError` wire form (issue #207); `SessionEntry::peer_unreachable` round-trips and defaults to reachable for an older sender (issue #208); the spec conformance tests (`spec.rs`: `docs/protocol.md`'s message catalogue matches `ClientMessage`/`ServerMessage` exactly, its timing table matches `kmux_protocol::timing`, and every test its state tables name exists) and a fixture per lenient enum (issue #209); the catalogue's **Federated** column is `ClientMessage::federation`, over one sample of every variant, whose completeness is itself checked (issue #227) | wire fixtures — the crate is pure data, so every test is tier *pure* | — |
-| `kmux-sys` | 64 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants; a stalled TLS handshake does not block the next accept, and times out; a QUIC connection establishes off the accept with its control stream; the accept loop backs off after a failed accept (issue #206, loopback sockets, paused clock); handshake admission (issue #207): the per-source and listener-wide bounds refuse at once rather than queue, slots come back when a handshake ends, zero bounds are refused at construction, IPv6 sources group by /64 (pure `InFlight` tests plus a scripted `Listener` on the paused clock), and on loopback QUIC a dropped attempt is refused at once, a Retry brings the client back validated, and `serve` admits a retried client. The crate re-lists itself as a dev-dependency with its transport and `identity` features, so `cargo test -p kmux-sys` — and so cargo-mutants — builds the listeners these tests cover | `Dirs::rooted` | keyring |
-| `kmux-app` | 300 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick; automatic reconnect (issue #208): the backoff schedule, the outage input buffer (kept in order to capacity, overflow counted, flushed on reconnect), the banner text, and the driver keeping the UI live, holding keys and delivering them in order, a refusal ending the retries, held input dropped for another daemon run or past 30 s, the banner repainting when it changes (pure, time injected through `tick_at`) | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
-| `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites; backpressure and lock discipline (issue #206): input queue full without blocking the `sessions` lock, bounded outbound queue with lag → `SyncReset` resync, write timeout, auth/pong deadlines (pure verdicts + paused-clock watchdog), per-hold relay byte cap, `term_state` poison recovery, task supervisor; deadlines (issue #207): the control socket's deadline and request cap with their typed error replies (paused clock and `UnixStream::pair`), a `restart` cut off before hand-over rolling back its busy mark (at the `BegunHandoff` guard), a non-UTF-8 request refused as malformed, a stalled QUIC pane stream reset alone with a `Lagged` resync while the connection stays up (loopback QUIC, real clock, a 200 ms stall timeout); a federated pane's first viewer asks the peer for a snapshot even when it resumes from a seqno (issue #208); resume (issue #208): a superseded channel ending leaves the resumed registration and its re-attached pane intact while releasing its own, only the current generation releases, another machine's identity gets a fresh connection, a resumed client is replayed exactly the diffs after its `last_seqno` (or reset past the retained window), and a lagged broadcast forwarder sends a resync session list and keeps running (paused clock); the federation link (issue #208): a dropped link leaves the peer unreachable and is re-opened under the same local words with its panes re-attached, a silent peer is pinged then declared unreachable, the peer's list, closes, layouts and lifecycle events keep the hub's listing current (paused clock over a channel-played peer), the e2e freeze-and-thaw of a real remote, and a real peer's own close (a direct client's, or the hub closing its last tab) dropping the session from the hub's list (issue #202); request parity (issue #227): every shape of forwarded answer routed back to its sender under its own id and word, answers without an id to the sender of the oldest run (routes, runs and ping barriers), refusals under the request's id, a create registered under a fresh word, the hub's input-lock arbitration, a dropped link answering what was in flight, events broadcast to every client, a digest relayed or a wrong mirror resynced, snapshot mode and a channel's end reaching proxied panes, the router releasing what a close closes, and the e2e tab/split/rename/close of a proxied session and a history answered only to its asker | `crate::fixtures` (`fixture_app`, `fixture_client_state`, `NoopAttacher`, …), `NullEventSink` (via `kmux-vt-core/test-util`); e2e: `harness::{Sandbox, Daemon, Federation}` | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
-| `kmux-client` | 163 | 3 | server-message handling, grid apply, selection, input, liveness; grid-apply proptest (R10); reconnect backoff (`next_delay` table: doubling to the cap, jitter never lengthens, monotonic per seed) and every visible pane re-attached from its last seqno on a new link (issue #208); a session list as the whole truth (issue #208): unlisted sessions close, the viewed tab follows its listed layout | channel injection | — |
-| `kmux-connect` | 85 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals; a control `ControlError` reply read as an `Err` naming the refusal (issue #207); on loopback QUIC, 150 pane streams held open at once are all read (issue #208) | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
+| `kmux-protocol` | 158 | — | codec byte fixtures, framing, version/capability negotiation, message categories (one message per category, and no client message is a resync — the exhaustive `match` in `category()` classifies the rest), compat classification; the control socket's `ControlError` wire form (issue #207); `SessionEntry::peer_unreachable` round-trips and defaults to reachable for an older sender (issue #208); the spec conformance tests (`spec.rs`: `docs/protocol.md`'s message catalogue matches `ClientMessage`/`ServerMessage` exactly, its timing table matches `kmux_protocol::timing`, and every test its state tables name exists) and a fixture per lenient enum (issue #209); the catalogue's **Federated** column is `ClientMessage::federation`, over one sample of every variant, whose completeness is itself checked (issue #227) | wire fixtures — the crate is pure data, so every test is tier *pure* | — |
+| `kmux-sys` | 81 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants; a stalled TLS handshake does not block the next accept, and times out; a QUIC connection establishes off the accept with its control stream; the accept loop backs off after a failed accept (issue #206, loopback sockets, paused clock); handshake admission (issue #207): the per-source and listener-wide bounds refuse at once rather than queue, slots come back when a handshake ends, zero bounds are refused at construction, IPv6 sources group by /64 (pure `InFlight` tests plus a scripted `Listener` on the paused clock), and on loopback QUIC a dropped attempt is refused at once, a Retry brings the client back validated, and `serve` admits a retried client. The crate re-lists itself as a dev-dependency with its transport and `identity` features, so `cargo test -p kmux-sys` — and so cargo-mutants — builds the listeners these tests cover | `Dirs::rooted` | keyring |
+| `kmux-app` | 394 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick; automatic reconnect (issue #208): the backoff schedule, the outage input buffer (kept in order to capacity, overflow counted, flushed on reconnect), the banner text, and the driver keeping the UI live, holding keys and delivering them in order, a refusal ending the retries, held input dropped for another daemon run or past 30 s, the banner repainting when it changes (pure, time injected through `tick_at`) | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
+| `kmuxd` | 461 | 28 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); five e2e suites; lifecycle end to end (issue #211): in `lifecycle_e2e`, a shell's `exit` status reaching the attached client, a returning client sent only the diffs it missed or reset when too far behind, and SIGTERM and idle shutdown leaving no control socket or pid file; in `handoff_e2e`, text printed before a live handoff still on the successor's screen; in `process_isolation_e2e`, a crash-looping worker respawned `MAX_RESTARTS` times then left faulted; the attach catch-up (`compute_replay`, one table) and the input lock's transitions; backpressure and lock discipline (issue #206): input queue full without blocking the `sessions` lock, bounded outbound queue with lag → `SyncReset` resync, write timeout, auth/pong deadlines (pure verdicts + paused-clock watchdog), per-hold relay byte cap, `term_state` poison recovery, task supervisor; deadlines (issue #207): the control socket's deadline and request cap with their typed error replies (paused clock and `UnixStream::pair`), a `restart` cut off before hand-over rolling back its busy mark (at the `BegunHandoff` guard), a non-UTF-8 request refused as malformed, a stalled QUIC pane stream reset alone with a `Lagged` resync while the connection stays up (loopback QUIC, real clock, a 200 ms stall timeout); a federated pane's first viewer asks the peer for a snapshot even when it resumes from a seqno (issue #208); resume (issue #208): a superseded channel ending leaves the resumed registration and its re-attached pane intact while releasing its own, only the current generation releases, another machine's identity gets a fresh connection, a resumed client is replayed exactly the diffs after its `last_seqno` (or reset past the retained window), and a lagged broadcast forwarder sends a resync session list and keeps running (paused clock); the federation link (issue #208): a dropped link leaves the peer unreachable and is re-opened under the same local words with its panes re-attached, a silent peer is pinged then declared unreachable, the peer's list, closes, layouts and lifecycle events keep the hub's listing current (paused clock over a channel-played peer), the e2e freeze-and-thaw of a real remote, and a real peer's own close (a direct client's, or the hub closing its last tab) dropping the session from the hub's list (issue #202); request parity (issue #227): every shape of forwarded answer routed back to its sender under its own id and word, answers without an id to the sender of the oldest run (routes, runs and ping barriers), refusals under the request's id, a create registered under a fresh word, the hub's input-lock arbitration, a dropped link answering what was in flight, events broadcast to every client, a digest relayed or a wrong mirror resynced, snapshot mode and a channel's end reaching proxied panes, the router releasing what a close closes, and the e2e tab/split/rename/close of a proxied session and a history answered only to its asker | `crate::fixtures` (`fixture_app`, `fixture_client_state`, `NoopAttacher`, …), `NullEventSink` (via `kmux-vt-core/test-util`); `app::fixtures` (`fixture_relay`, `push_seqnos`); e2e: `harness::{Sandbox, Daemon, Federation, Screen}` | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
+| `kmux-client` | 255 | 3 | server-message handling, grid apply, selection, input, liveness; grid-apply proptest (R10); reconnect backoff (`next_delay` table: doubling to the cap, jitter never lengthens, monotonic per seed) and every visible pane re-attached from its last seqno on a new link (issue #208); a session list as the whole truth (issue #208): unlisted sessions close, the viewed tab follows its listed layout | channel injection | — |
+| `kmux-connect` | 99 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals; a control `ControlError` reply read as an `Err` naming the refusal (issue #207); on loopback QUIC, 150 pane streams held open at once are all read (issue #208) | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
 | `kmux-vt-core` | 71 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
-| `kmux-render` | 54 | — | geometry, packed format, atlas packing, colour, dirty-row parity | — | GPU adapter (skips cleanly, R11) |
-| `kmux-pty` | 54 | — | timeout policy, registry, expect parser, size math; process hygiene (issue #205): close-on-exec masters, what a child inherits (fds, cwd, signal state), start failures, the reaper, process-group close (and none for an exited child), fd count across close cycles; a failed reaper start is retried by the next spawn and a success kept (issue #207, `get_or_start` with an injected start) | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | termios |
+| `kmux-render` | 57 | — | geometry, packed format, atlas packing, colour, dirty-row parity | — | GPU adapter (skips cleanly, R11) |
+| `kmux-pty` | 55 | — | timeout policy, registry, expect parser, size math; concurrent spawns (32 on 16 threads, which collide on macOS without the `forkpty` lock); process hygiene (issue #205): close-on-exec masters, what a child inherits (fds, cwd, signal state), start failures, the reaper, process-group close (and none for an exited child), fd count across close cycles; a failed reaper start is retried by the next spawn and a success kept (issue #207, `get_or_start` with an injected start) | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | termios |
 | `kmux-ghostty` | 26 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
-| `kmux-ffi` | 17 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
-| `kmux-gtk` | 14 | — | keyval→protocol conversion, accel→action table, the connection banner's content and the reconnecting badge (issue #208) | — | **all widget construction and the glib main loop** |
+| `kmux-ffi` | 23 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
+| `kmux-gtk` | 21 | — | keyval→protocol conversion, accel→action table, the connection banner's content and the reconnecting badge (issue #208) | — | **all widget construction and the glib main loop** |
 | `kmux-vt-worker` | 0 | 1 | subprocess smoke: PTY output becomes diffs, a heartbeat `Ping` is answered, and a `Hold` parks the PTY reader until `Release` (issue #207) | — | fd adoption over `SCM_RIGHTS` |
 | `kmux-ghostty-sys` | 6 | — | ABI version constant | — | Zig internals, all raw bindings |
 | `kmux-worker-protocol` | 6 | — | postcard roundtrip, version constant | — | — |
@@ -290,11 +295,19 @@ duplication they exist to remove.
   is seen as soon as it is gone, and a deadline already passed is a single
   probe. It never reaps, so a zombie counts as alive: waiting on it asserts
   the child was both killed and reaped (by whichever task owns the `waitpid`).
-- **The `kmuxd/tests/harness`**: `Sandbox` (a private XDG root, R3),
-  `Daemon` (spawn one into a sandbox), `Federation` (`spawn_pair()` starts a
-  remote and a local hub; `open_peer()` federates them through a connected GUI
-  and returns it with the peer id), and `E2E_TIMEOUT`, the one bound on every
-  e2e wait. A shorter bound needs a comment saying why.
+- **`kmuxd`'s `app::fixtures`** (`crates/kmuxd/src/app/mod.rs`):
+  `fixture_relay(rows, cols)` (a pane relay with no child behind it) and
+  `push_seqnos(relay, range)` (diffs buffered as if the pane produced them).
+- **The `kmuxd/tests/harness`**: `Sandbox` (a private XDG root, R3; its
+  `daemon_log()` belongs in a failure message), `Daemon` (spawn one into a
+  sandbox; `.isolated()`, `.config(toml)`), `Federation` (`spawn_pair()` starts
+  a remote and a local hub; `open_peer()` federates them through a connected
+  GUI and returns it with the peer id), `Screen` (a pane rebuilt from what a
+  client receives, recording the snapshots, resets and diffs it applied;
+  `follow_until(client, text)` is the wait for output), `attach` /
+  `type_into`, `wait_for` (an async poll — never `std::thread::sleep` on the
+  test's runtime), and `E2E_TIMEOUT`, the one bound on every e2e wait. A
+  shorter bound needs a comment saying why.
 - **`kmux-vt-worker` is a build prerequisite, not a test step.** `cargo test`
   builds only a package's own binaries, so `mise run test` depends on the
   `build-vt-worker` task and the harness only locates the binary, failing with
@@ -330,8 +343,8 @@ shards each ran the same full sweep. Both produced valid-looking results, which
 is the failure mode this document exists to distrust.
 
 A mutant that hangs a test is recorded as a timeout, which counts as caught,
-but it costs the whole per-mutant timeout, and the per-PR job has an hour. Two
-rules keep hung mutants cheap:
+but it costs the whole per-mutant timeout, and each of the per-PR job's four
+shards has an hour. Two rules keep hung mutants cheap:
 
 - **A test that waits, waits bounded.** Every wait on a channel, a socket or a
   task sits under `tokio::time::timeout`, and a polling loop sleeps rather than
@@ -406,7 +419,7 @@ Adding a row is a normative change: justify it in the commit that adds it.
 | The live connection's drivers: `SessionManager::connect`, `TransportSupervisor::run`, `AppCore::launch_ssh_supervisor`, `dry_run::run_supervisor_phase`, `tcp_connect::send_auth_frame` | Each needs a real daemon or SSH peer to reach, or loads this user's real identity; their body mutants are excluded by `exclude_re` in `.cargo/mutants.toml` (issue #209) | the decisions they delegate: `apply_outcome` / `resume_from`, `ensure_active` / `probe_verdict`, `auth_message`, all unit-tested; `--dry-run` / `--test` exercise the drivers against a real daemon |
 | `kmux-app`'s `authenticate` | Loads this user's real machine identity (`Identity::load_or_create`), then calls `authenticate_as`; its `Ok(())` mutant is excluded by `exclude_re` in `.cargo/mutants.toml` (issue #209) | `authenticate_as`, driven over `tokio::io::duplex` with a generated identity |
 | `kmuxd`'s `probe_or_start` and the `query` it nests (`kmuxd probe-or-start`) | Reads this profile's real control socket and starts a daemon when none answers; only a real SSH bootstrap reaches it. Its body-replacement mutants are excluded by `exclude_re` in `.cargo/mutants-bin.toml` (issue #227) | `ssh_view`, the endpoint choice it makes, is unit-tested |
-| `kmuxd::startup::async_main` (383 lines) | A linear boot script — bind, TLS, handoff, listeners, signals. Every split yields a function nothing can assert on without a live daemon. Exempt from R4, and its body-replacement mutant is excluded by `exclude_re` in `.cargo/mutants-bin.toml` like `fn main`'s (issue #206) | the five `kmuxd/tests/*_e2e.rs` suites |
+| `kmuxd::startup::async_main` (417 lines) | A linear boot script — bind, TLS, handoff, listeners, signals. Every split yields a function nothing can assert on without a live daemon. Exempt from R4, and its body-replacement mutant is excluded by `exclude_re` in `.cargo/mutants-bin.toml` like `fn main`'s (issue #206) | the five `kmuxd/tests/*_e2e.rs` suites |
 | `kmuxd` fork/exec, `SCM_RIGHTS`, daemonize | Cannot run in-process | `handoff_e2e.rs`, `process_isolation_e2e.rs` |
 | `kmuxd`'s `fn main` | A process entrypoint (CLI parse, daemonize, runtime build and teardown) no unit test can call, so its body-replacement mutant is always missed under `--bins`; excluded by `exclude_re` in `.cargo/mutants-bin.toml` so a comment edit in it does not fail the zero-survivor diff job (issue #205) | the five `kmuxd/tests/*_e2e.rs` suites, which spawn the binary |
 | `kmux-app`'s `fetch_remote_logs` (`kmux daemon logs --server`) | Resolves, connects to and authenticates with a remote daemon before streaming; with no daemon to reach, its body-replacement mutant is always missed, so `exclude_re` in `.cargo/mutants.toml` excludes it (issue #206) | `stream_logs`, the stream loop it hands off to, is unit-tested over `tokio::io::duplex` |

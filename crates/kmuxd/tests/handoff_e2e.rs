@@ -16,50 +16,54 @@ mod harness;
 use std::path::Path;
 
 use harness::{
-    Cleanup, Daemon, SIZE, Sandbox, connect_client, daemon_token, pid_alive, poll_until,
-    read_pid_file, recv_until, wait_for_daemon,
+    Cleanup, Daemon, SIZE, Sandbox, Screen, attach, connect_client, daemon_token, pid_alive,
+    poll_until, read_pid_file, recv_until, wait_for_daemon,
 };
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
-use tokio::sync::mpsc;
 
-/// Connect over the data UDS, create a session whose initial pane runs a shell that
-/// records its own PID to `pidfile`, then drop the client. The session persists
-/// server-side. Returns the shell's PID.
+/// What the suite's session prints before it settles into `sleep`, so a test
+/// can look for it on the screen afterwards.
+const MARKER: &str = "PRINTED_BEFORE_THE_HANDOFF";
+
+/// Connect over the data UDS and create a session whose pane records its
+/// shell's PID to `pidfile` and prints [`MARKER`], then drop the client. The
+/// session persists server-side. Returns the session's first pane and the PID.
 async fn create_session_with_recorded_child(
     sandbox: &Sandbox,
     token: &str,
-    cwd: &Path,
     pidfile: &Path,
-) -> i32 {
+) -> (String, i32) {
     let mut client = connect_client(sandbox, token).await;
-    let mut srv_rx = std::mem::replace(&mut client.rx, mpsc::unbounded_channel().1);
-    let client_tx = client.tx.clone();
-
     // `exec sleep` so the recorded PID *is* the long-lived process the handoff must
     // keep alive (no intermediate `sh` that could exit and change the PID).
-    let script = format!("echo $$ > {}; exec sleep 600", pidfile.display());
-    client_tx
-        .send(ClientMessage::SessionCreate {
-            request_id: 1,
-            name: Some("e2e".into()),
-            peer: None,
-            cwd: Some(cwd.display().to_string()),
-            program: Some("/bin/sh".into()),
-            args: vec!["-c".into(), script],
-            size: SIZE,
-        })
-        .expect("send SessionCreate");
+    let script = format!(
+        "echo $$ > {}; echo {MARKER}; exec sleep 600",
+        pidfile.display()
+    );
+    let sent = client.tx.send(ClientMessage::SessionCreate {
+        request_id: 1,
+        name: Some("e2e".into()),
+        peer: None,
+        cwd: Some(sandbox.path().display().to_string()),
+        program: Some("/bin/sh".into()),
+        args: vec!["-c".into(), script],
+        size: SIZE,
+    });
+    assert!(sent.is_ok(), "send SessionCreate");
 
-    let created = recv_until(&mut srv_rx, harness::E2E_TIMEOUT, |m| {
+    let created = recv_until(&mut client.rx, harness::E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionCreated { .. })
     })
     .await;
-    assert!(created.is_some(), "expected a SessionCreated ack");
-
-    let pid = read_pid_file(pidfile, harness::E2E_TIMEOUT).expect("shell wrote its PID");
-    // Drop the client connection — the server keeps the session alive without it.
-    drop(client_tx);
-    pid
+    let word = match created {
+        Some(ServerMessage::SessionCreated { entry, .. }) => entry.meta.word_id,
+        _ => String::new(),
+    };
+    assert!(!word.is_empty(), "expected a SessionCreated ack");
+    let pid = read_pid_file(pidfile, harness::E2E_TIMEOUT)
+        .await
+        .expect("shell wrote its PID");
+    (format!("{word}/0"), pid)
 }
 
 /// B1: a real cross-process `restart` migrates the live shell — same process, new
@@ -95,18 +99,15 @@ async fn live_restart_preserves_the_shell(isolated: bool) -> anyhow::Result<()> 
 
     let token = daemon_token(&sandbox).await;
     let pidfile = sandbox.path().join("child.pid");
-    let child =
-        create_session_with_recorded_child(&sandbox, &token, sandbox.path(), &pidfile).await;
+    let (pane, child) = create_session_with_recorded_child(&sandbox, &token, &pidfile).await;
     cleanup.track(child);
     assert!(pid_alive(child), "shell should be alive before the restart");
-    assert!(
-        kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
-            .await
-            .context("the daemon answers")?
-            .session_count
-            >= 1,
-        "the session should be present before the restart"
-    );
+    // The marker is on screen before the restart, so finding it after
+    // means the screen crossed over, not that it was printed late.
+    let mut before = connect_client(&sandbox, &token).await;
+    attach(&before, &pane, None);
+    assert!(Screen::new(&pane).follow_until(&mut before, MARKER).await);
+    drop(before);
 
     let accepted = kmux_client::daemon::restart_daemon_at(&sandbox.socket_path())
         .await
@@ -131,13 +132,15 @@ async fn live_restart_preserves_the_shell(isolated: bool) -> anyhow::Result<()> 
         pid_alive(child),
         "the running shell must survive the live restart"
     );
+    // And so does what it put on screen: a client of the successor sees the
+    // marker the shell printed only before the handoff.
+    let mut after = connect_client(&sandbox, &token).await;
+    attach(&after, &pane, None);
+    let mut screen = Screen::new(&pane);
     assert!(
-        kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
-            .await
-            .context("the successor answers")?
-            .session_count
-            >= 1,
-        "the session must persist across the restart"
+        screen.follow_until(&mut after, MARKER).await,
+        "the screen must survive the live restart, but shows {:?}",
+        screen.text().trim_end()
     );
 
     let _ = kmux_client::daemon::stop_daemon_at(&sandbox.socket_path()).await;
@@ -166,8 +169,7 @@ async fn in_place_binary_swap_still_hands_off() {
     cleanup.track(old_pid as i32);
     let token = daemon_token(&sandbox).await;
     let pidfile = sandbox.path().join("child.pid");
-    let child =
-        create_session_with_recorded_child(&sandbox, &token, sandbox.path(), &pidfile).await;
+    let (_, child) = create_session_with_recorded_child(&sandbox, &token, &pidfile).await;
     cleanup.track(child);
 
     // Simulate `cargo install`'s atomic replace: stage a fresh copy and rename it

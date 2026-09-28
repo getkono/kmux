@@ -24,13 +24,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
-      # One failing shard must not cancel the rest: a shard's exit code is
-      # non-zero whenever any mutant survives, which is the normal state of a
-      # codebase paying down mutation debt. The verdict comes from the gate in
-      # the `judge` job below, over the merged outcomes.
+      # One failing shard must not cancel the rest. A shard fails only when it
+      # did not measure everything it was given (a crate group that did not
+      # run, or the timeout) -- surviving mutants still exit 0 -- and the
+      # `judge` job below refuses the sweep then; the others finishing says
+      # what they found. The verdict comes from the gate over the merged
+      # outcomes.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        # cargo-mutants numbers shards from 0: `--shard k/n` needs k < n.
+        # These once ran 1-8, so shard 8 refused to start and shard 0 — an
+        # eighth of the mutants — never ran, while the judge read the other
+        # seven as the whole sweep.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,6 +101,23 @@ jobs:
           pattern: mutants-shard-*
           path: shards/
 
+      # A shard that never ran uploads nothing, and one cut off by its timeout
+      # uploads part of its share; either way seven shards merged look exactly
+      # like a sweep of everything, with the missing mutants' survivors
+      # uncounted and every budget too tight by them.
+      - name: Every shard ran
+        id: complete
+        run: |
+          if [ "${{ needs.sweep.result }}" != "success" ]; then
+            echo "::error::a shard did not finish (${{ needs.sweep.result }}); a partial sweep is not judged"
+            exit 1
+          fi
+          uploaded=$(find shards -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$uploaded" -ne 8 ]; then
+            echo "::error::$uploaded of 8 shards uploaded results; a partial sweep is not judged"
+            exit 1
+          fi
+
       # Every shard directory, in one call: the gate merges them, so a package
       # split across shards is judged on its total rather than eight times on
       # eight partial views.
@@ -109,7 +132,7 @@ jobs:
       # opening a PR keeps the budget a deliberate, reviewed edit — the same
       # rule the lint ratchet follows.
       - name: What the budgets would become
-        if: always()
+        if: always() && steps.complete.outcome == 'success'
         run: |
           dirs=$(find shards -name outcomes.json -printf '%h\n' | sort)
           # shellcheck disable=SC2086

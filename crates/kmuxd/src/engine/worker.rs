@@ -1308,16 +1308,31 @@ mod tests {
         assert_eq!(&buf[..n], b"ready");
         assert!(!input_blocked(master), "room for input");
 
+        // A refused write is not yet a full terminal: Linux moves what the
+        // master took into the child's line discipline on a worker of its
+        // own, which frees room again. So keep writing until the kernel has
+        // nowhere left to put it, not until the first `EAGAIN`.
         let chunk = [b'x'; 4096];
         let mut written = 0usize;
-        while !input_blocked(master) && written < 1 << 20 {
+        // The verdict is the poll that ended the loop, not a second one: a
+        // flush still in flight could free room again between the two.
+        let deadline = std::time::Instant::now() + GUARD;
+        let blocked = loop {
+            if input_blocked(master) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             match nix::unistd::write(master, &chunk) {
                 Ok(n) => written += n,
-                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
                 Err(e) => panic!("write to the master: {e}"),
             }
-        }
-        assert!(input_blocked(master), "full after {written} bytes");
+        };
+        assert!(blocked, "still room after {written} bytes");
     }
 
     /// A worker whose stream went bad is killed rather than waited on; one

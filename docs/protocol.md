@@ -393,7 +393,7 @@ tables.
 <!-- spec:states-attach -->
 | From | Event | To | Pinned by |
 |---|---|---|---|
-| detached | `Attach { last_seqno: None }` | awaiting sync; the daemon sends a snapshot | `compute_replay_fresh_attach_returns_full_snapshot` |
+| detached | `Attach { last_seqno: None }` | awaiting sync; the daemon sends a snapshot | `an_attach_is_sent_a_snapshot_the_missed_diffs_or_a_reset` |
 | detached | `Attach` for an unknown pane | detached (`Error PaneNotFound`) | `attach_to_an_unknown_pane_errors_and_starts_no_stream` |
 | awaiting sync | `TerminalSnapshot` at seqno `n` | synced, expecting `n + 1` | `terminal_snapshot_transitions_to_synced` |
 | awaiting sync | a diff | awaiting sync, the diff discarded | `terminal_update_discarded_when_awaiting_sync`, `cursor_update_for_a_pane_awaiting_sync_is_discarded_and_counted` |
@@ -402,11 +402,11 @@ tables.
 | synced | `SyncReset` | awaiting sync | `sync_reset_clears_the_grid_and_parks_the_pane_awaiting_sync` |
 | synced | `Lagged` | awaiting sync; re-attached | `lagged_clears_the_grid_counts_the_lag_and_reattaches_the_pane` |
 | synced (`n`) | `GridDigest` at `n - 1` that does not match | awaiting sync; re-attached | `grid_digest_mismatch_triggers_one_resync`, `grid_digest_match_does_not_resync` |
-| synced (`n`) | a new link to the same daemon run | `Attach { last_seqno: Some(n - 1) }`; the daemon replays the rest | `a_new_link_resumes_every_visible_pane_from_its_last_seqno`, `compute_replay_delta_under_threshold_returns_delta`, `a_resumed_client_is_replayed_from_its_last_seqno` |
+| synced (`n`) | a new link to the same daemon run | `Attach { last_seqno: Some(n - 1) }`; the daemon replays the rest | `a_new_link_resumes_every_visible_pane_from_its_last_seqno`, `an_attach_is_sent_a_snapshot_the_missed_diffs_or_a_reset`, `a_resumed_client_is_replayed_from_its_last_seqno`, `a_returning_client_is_sent_what_it_missed_or_reset_when_too_far_behind` |
 | synced | a new link to another daemon run | `Attach { last_seqno: None }` | `a_new_link_to_another_daemon_run_attaches_every_pane_afresh` |
-| (daemon) | `Attach { Some(n) }` with more missed diffs than the threshold | `SyncReset` + snapshot | `compute_replay_delta_over_threshold_coalesces_to_syncreset` |
-| (daemon) | `Attach { Some(n) }` older than the retained diffs | `SyncReset` + snapshot | `compute_replay_from_a_seqno_older_than_the_retained_diffs_resets` |
-| (daemon) | `Attach { Some(n) }` past the pane's current seqno | `SyncReset` + snapshot | `compute_replay_from_a_seqno_this_pane_never_reached_resets` |
+| (daemon) | `Attach { Some(n) }` with more missed diffs than the threshold | `SyncReset` + snapshot | `an_attach_is_sent_a_snapshot_the_missed_diffs_or_a_reset`, `a_returning_client_is_sent_what_it_missed_or_reset_when_too_far_behind` |
+| (daemon) | `Attach { Some(n) }` older than the retained diffs | `SyncReset` + snapshot | `an_attach_is_sent_a_snapshot_the_missed_diffs_or_a_reset` |
+| (daemon) | `Attach { Some(n) }` past the pane's current seqno | `SyncReset` + snapshot | `an_attach_is_sent_a_snapshot_the_missed_diffs_or_a_reset` |
 | (daemon) | a viewer's pane stream is full | `Lagged` on control; the viewer is dropped from the pane | `broadcast_sends_lagged_via_ctrl_when_data_full`, `broadcast_removes_client_after_full` |
 | (daemon) | the shared TCP/UDS queue is congested | pane frames dropped, then `SyncReset` + snapshot | `a_congested_pane_stream_stays_bounded_and_resyncs_once_the_client_reads` |
 | any | `Detach` | detached; nothing is answered | `detach_from_a_pane_this_client_never_attached_answers_nothing` |

@@ -65,32 +65,22 @@ impl fmt::Display for MessageCategory {
 mod tests {
     use super::*;
 
+    /// `all()` lists every category once, in display order, each shown by its
+    /// name: one invariant over the whole enum (R9).
     #[test]
-    fn all_has_six_distinct_categories() {
+    fn all_lists_each_category_once_in_display_order() {
         let all = MessageCategory::all();
-        assert_eq!(all.len(), 6);
-        let mut seen = std::collections::HashSet::new();
-        for c in all {
-            assert!(seen.insert(c), "duplicate category: {c}");
-        }
-    }
-
-    #[test]
-    fn sort_keys_are_unique() {
-        let keys: Vec<u8> = MessageCategory::all()
-            .iter()
-            .map(|c| c.as_sort_key())
-            .collect();
-        let mut uniq = keys.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(keys.len(), uniq.len());
-    }
-
-    #[test]
-    fn display_roundtrips() {
-        for c in MessageCategory::all() {
-            assert!(!c.to_string().is_empty());
-        }
+        let keys: Vec<u8> = all.iter().map(|c| c.as_sort_key()).collect();
+        assert_eq!(keys, [0, 1, 2, 3, 4, 5]);
+        let names: Vec<String> = all.iter().map(ToString::to_string).collect();
+        let expected = [
+            "Shell",
+            "Scrollback",
+            "Liveness",
+            "Control",
+            "Sync",
+            "Bootstrap",
+        ];
+        assert_eq!(names, expected);
     }
 }

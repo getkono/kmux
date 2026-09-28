@@ -310,6 +310,12 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         });
     }
 
+    // Install signal handlers now: nothing after the control socket starts may
+    // return early, or the socket and pid file outlive the daemon.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    // The control socket's task; ending it removes the socket and pid file.
+    let mut control = None;
     if daemon {
         let params = crate::daemon::ControlSocketParams {
             socket_path: kmux_sys::dirs::socket_path()?,
@@ -327,9 +333,10 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             handoff_successor: handoff,
         };
         let stop = crate::daemon::termination_signal()?;
-        tokio::spawn(async move {
-            crate::daemon::serve_control_socket(params, stop).await;
-        });
+        let pid_path = params.pid_path.clone();
+        control = Some(tokio::spawn(crate::daemon::serve_control_socket(
+            params, stop,
+        )));
 
         // A handoff successor must claim the pid file itself (it started
         // without one). Wait for the predecessor to exit so its pid-file cleanup
@@ -337,7 +344,6 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         // answers `status` (which reports the live pid), so this is not on the
         // critical path for clients.
         if handoff {
-            let pid_path = kmux_sys::dirs::pid_path()?;
             tokio::spawn(async move {
                 if let Some(pid) = predecessor {
                     let alive = move || nix::sys::signal::kill(pid, None).is_ok();
@@ -355,9 +361,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         }
     }
 
-    // Install signal handlers and wait for a shutdown or restart signal.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
+    // Wait for a shutdown or restart signal.
     // `true` once a graceful handoff committed: we wrote the final checkpoint
     // and the successor owns the live PTYs, so we skip our shutdown checkpoint.
     let mut handed_off = false;
@@ -427,6 +431,16 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
 
     for endpoint in quic_endpoints {
         endpoint.close(0u32.into(), b"shutdown");
+    }
+
+    // Only a signal ends the control socket's task by itself; a daemon
+    // stopped any other way (`kmux daemon stop`, idle shutdown) ends it here.
+    // Awaited, because `main` shuts the runtime down without waiting for its
+    // tasks to drop: the socket and pid file went, or did not, by the luck of
+    // that race.
+    if let Some(control) = control {
+        control.abort();
+        let _ = control.await;
     }
     Ok(())
 }
