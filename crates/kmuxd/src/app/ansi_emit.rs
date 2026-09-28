@@ -288,6 +288,31 @@ mod tests {
         assert_eq!(seeded.history_total, 1, "the one history line, no more");
     }
 
+    /// A row's trailing blanks of the default style are not written — a fresh
+    /// emulator holds them already — while a styled blank is, and so is a
+    /// default blank with content after it (issue #234).
+    #[test]
+    fn only_trailing_default_blanks_are_left_out() {
+        fn text(s: &str) -> impl Iterator<Item = CellState> + '_ {
+            s.chars().map(|c| CellState {
+                c,
+                ..CellState::default()
+            })
+        }
+        let mut underlined = CellState::default();
+        underlined.attrs.0 |= CellAttrs::UNDERLINE;
+        let emitted = |cells: Vec<CellState>| {
+            let mut out = Vec::new();
+            emit_cells(&mut out, &cells);
+            String::from_utf8(out).unwrap()
+        };
+
+        assert_eq!(emitted(text("a b  ").collect()), "\x1b[0ma b\x1b[0m");
+        let styled = text("a").chain([underlined]).chain(text(" ")).collect();
+        assert_eq!(emitted(styled), "\x1b[0ma\x1b[0;4m \x1b[0m");
+        assert_eq!(emitted(text("   ").collect()), "\x1b[0m");
+    }
+
     /// A wide cell whose stored character is narrow on its own — a grapheme
     /// made wide by VS16 under mode 2027, stored as its base — leaves the rest
     /// of the row where it was (issue #234).
