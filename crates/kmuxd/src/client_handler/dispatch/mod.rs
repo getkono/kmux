@@ -493,6 +493,72 @@ pub(super) mod testing {
         }
     }
 
+    /// One row of a rejection table: a message that must be answered with
+    /// exactly one `Error`, identified by `label` in any failure.
+    pub(super) struct Rejected {
+        pub(super) label: &'static str,
+        pub(super) msg: ClientMessage,
+        pub(super) request_id: Option<u64>,
+        pub(super) code: ErrorCode,
+        pub(super) message: String,
+    }
+
+    /// Dispatch each case alone to a fresh client on an empty server and
+    /// assert it keeps the connection open and answers exactly its `Error`.
+    pub(super) async fn assert_all_rejected(cases: Vec<Rejected>) {
+        for case in cases {
+            let label = case.label;
+            let (keep, msgs) = dispatch_one(case.msg).await;
+            assert!(keep, "{label}: the connection must stay open");
+            let [
+                ServerMessage::Error {
+                    request_id,
+                    code,
+                    message,
+                },
+            ] = msgs.as_slice()
+            else {
+                panic!("{label}: expected exactly one Error, got {msgs:?}");
+            };
+            assert_eq!(
+                (*request_id, *code, message.as_str()),
+                (case.request_id, case.code, case.message.as_str()),
+                "{label}"
+            );
+        }
+    }
+
+    /// `PaneNotFound` for [`MISSING_PANE`], as every pane-scoped arm reports it.
+    pub(super) fn pane_not_found(
+        label: &'static str,
+        request_id: Option<u64>,
+        msg: ClientMessage,
+    ) -> Rejected {
+        Rejected {
+            label,
+            msg,
+            request_id,
+            code: ErrorCode::PaneNotFound,
+            message: format!("pane not found: {MISSING_PANE}"),
+        }
+    }
+
+    /// `SessionNotFound` for [`MISSING_WORD`], as every session-scoped arm
+    /// reports it.
+    pub(super) fn session_not_found(
+        label: &'static str,
+        request_id: Option<u64>,
+        msg: ClientMessage,
+    ) -> Rejected {
+        Rejected {
+            label,
+            msg,
+            request_id,
+            code: ErrorCode::SessionNotFound,
+            message: format!("session not found: {MISSING_WORD}"),
+        }
+    }
+
     /// A single printable keystroke, so `PtyKeyBatch` gets past its
     /// empty-batch short circuit and reaches the pane lookup.
     pub(super) fn one_key() -> KeyEvent {

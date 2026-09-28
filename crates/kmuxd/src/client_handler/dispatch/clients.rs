@@ -64,32 +64,27 @@ mod tests {
     use super::super::testing::*;
 
     #[tokio::test]
-    async fn client_list_for_an_unknown_session_errors_with_the_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::ClientList {
-            request_id: 18,
-            word_id: MISSING_WORD.to_string(),
-        })
+    async fn client_ops_in_an_unknown_session_error_with_the_request_id() {
+        assert_all_rejected(vec![
+            session_not_found(
+                "ClientList",
+                Some(18),
+                ClientMessage::ClientList {
+                    request_id: 18,
+                    word_id: MISSING_WORD.to_string(),
+                },
+            ),
+            session_not_found(
+                "KickClient",
+                Some(19),
+                ClientMessage::KickClient {
+                    request_id: 19,
+                    word_id: MISSING_WORD.to_string(),
+                    client_id: ClientId(42),
+                },
+            ),
+        ])
         .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(18));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn kick_client_in_an_unknown_session_errors_with_the_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::KickClient {
-            request_id: 19,
-            word_id: MISSING_WORD.to_string(),
-            client_id: ClientId(42),
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(19));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     /// The other `KickClient` failure: the session is real, the client id is

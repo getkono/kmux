@@ -1367,10 +1367,12 @@ async fn recv_until(
 
 #[cfg(test)]
 mod tests {
+    use super::forward::testing::{Hub, fixture_hub, play_peer, viewing_client};
     use super::translate::{
         localize_entry, msg_pane_id, rewrite_event_to_local, sendable_clients, set_msg_pane_id,
     };
     use super::*;
+    use crate::outbound::OutboundRx;
     use kmux_protocol::messages::{
         ClientInfo, ConnectionId, FrontendKind, GridSnapshot, PaneInfo, SequenceNo, SessionMeta,
         SessionStatus, TabInfo,
@@ -1600,18 +1602,22 @@ mod tests {
         }
     }
 
-    /// A test viewer with a bounded data channel and a throwaway ctrl channel.
-    fn test_viewer(cap: usize, size: TermSize) -> (Viewer, mpsc::Receiver<ServerMessage>) {
+    /// A streaming test viewer with a data channel of `cap` slots, plus the
+    /// receiving ends of its data and ctrl channels.
+    fn test_viewer(
+        cap: usize,
+        size: TermSize,
+    ) -> (Viewer, mpsc::Receiver<ServerMessage>, OutboundRx) {
         let (data_tx, data_rx) = mpsc::channel(cap);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
-        (Viewer::new(data_tx, ctrl_tx, size), data_rx)
+        let (ctrl_tx, ctrl_rx) = crate::fixtures::make_outbound();
+        (Viewer::new(data_tx, ctrl_tx, size), data_rx, ctrl_rx)
     }
 
     #[test]
     fn proxied_pane_effective_size_is_smallest_wins() {
         let mut pane = ProxiedPane::new(sz(24, 80));
-        let (v1, _r1) = test_viewer(8, sz(24, 80));
-        let (v2, _r2) = test_viewer(8, sz(10, 40));
+        let (v1, _r1, _c1) = test_viewer(8, sz(24, 80));
+        let (v2, _r2, _c2) = test_viewer(8, sz(10, 40));
         pane.viewers.insert(ClientId(1), v1);
         pane.viewers.insert(ClientId(2), v2);
         // Smallest-wins across viewers (the size forwarded upstream).
@@ -1692,7 +1698,7 @@ mod tests {
     #[test]
     fn fan_out_delivers_to_healthy_viewer() {
         let mut pane = ProxiedPane::new(sz(24, 80));
-        let (v, mut rx) = test_viewer(8, sz(24, 80));
+        let (v, mut rx, _ctrl_rx) = test_viewer(8, sz(24, 80));
         pane.viewers.insert(ClientId(1), v);
 
         pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
@@ -1708,23 +1714,10 @@ mod tests {
     fn fan_out_sends_lagged_via_ctrl_and_drops_full_viewer() {
         // A capacity-1 data channel pre-filled so the next send overflows; the
         // viewer must then get a `Lagged` on its ctrl channel and be removed.
-        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
-        data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
-
+        let (viewer, _data_rx, mut ctrl_rx) = test_viewer(1, sz(24, 80));
+        viewer.data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
         let mut pane = ProxiedPane::new(sz(24, 80));
-        pane.viewers.insert(
-            ClientId(9),
-            Viewer {
-                data_tx,
-                ctrl_tx,
-                size: sz(24, 80),
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                snapshot_mode: false,
-            },
-        );
+        pane.viewers.insert(ClientId(9), viewer);
 
         pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
 
@@ -1743,23 +1736,11 @@ mod tests {
     fn fan_out_skips_paused_viewer_without_dropping_it() {
         // A paused viewer (issue #68) receives nothing and is retained even when its
         // channel is full — it resyncs on resume via re-attach, never lagged.
-        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
-        data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
-
+        let (mut viewer, _data_rx, mut ctrl_rx) = test_viewer(1, sz(24, 80));
+        viewer.data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
+        viewer.paused = true;
         let mut pane = ProxiedPane::new(sz(24, 80));
-        pane.viewers.insert(
-            ClientId(5),
-            Viewer {
-                data_tx,
-                ctrl_tx,
-                size: sz(24, 80),
-                paused: true,
-                pause_auto: false,
-                no_auto_pause: false,
-                snapshot_mode: false,
-            },
-        );
+        pane.viewers.insert(ClientId(5), viewer);
 
         pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
 
@@ -1778,22 +1759,12 @@ mod tests {
     fn fan_out_streams_auto_pause_exempt_viewer() {
         // An auto-paused viewer with a per-pane exemption keeps streaming through
         // the background pause (issue #68); a manual pause would still skip it.
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
-
+        let (mut viewer, mut data_rx, _ctrl_rx) = test_viewer(8, sz(24, 80));
+        viewer.paused = true;
+        viewer.pause_auto = true;
+        viewer.no_auto_pause = true;
         let mut pane = ProxiedPane::new(sz(24, 80));
-        pane.viewers.insert(
-            ClientId(5),
-            Viewer {
-                data_tx,
-                ctrl_tx,
-                size: sz(24, 80),
-                paused: true,
-                pause_auto: true,
-                no_auto_pause: true,
-                snapshot_mode: false,
-            },
-        );
+        pane.viewers.insert(ClientId(5), viewer);
 
         pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
         assert!(
@@ -1804,23 +1775,10 @@ mod tests {
 
     #[test]
     fn fan_out_drops_closed_viewer_silently() {
-        let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
+        let (viewer, data_rx, mut ctrl_rx) = test_viewer(8, sz(24, 80));
         drop(data_rx); // receiver gone → channel closed
-
         let mut pane = ProxiedPane::new(sz(24, 80));
-        pane.viewers.insert(
-            ClientId(3),
-            Viewer {
-                data_tx,
-                ctrl_tx,
-                size: sz(24, 80),
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                snapshot_mode: false,
-            },
-        );
+        pane.viewers.insert(ClientId(3), viewer);
 
         pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
 
@@ -1839,8 +1797,8 @@ mod tests {
     #[test]
     fn a_snapshot_mode_viewer_is_sent_the_mirror() {
         let mut pane = ProxiedPane::new(sz(24, 80));
-        let (diffs, mut diffs_rx) = test_viewer(8, sz(24, 80));
-        let (mut snaps, mut snaps_rx) = test_viewer(8, sz(24, 80));
+        let (diffs, mut diffs_rx, _) = test_viewer(8, sz(24, 80));
+        let (mut snaps, mut snaps_rx, _) = test_viewer(8, sz(24, 80));
         snaps.snapshot_mode = true;
         pane.viewers.insert(ClientId(1), diffs);
         pane.viewers.insert(ClientId(2), snaps);
@@ -1864,12 +1822,12 @@ mod tests {
     #[test]
     fn a_digest_reaches_streaming_diff_viewers_and_lags_none() {
         let mut pane = ProxiedPane::new(sz(24, 80));
-        let (diffs, mut diffs_rx) = test_viewer(8, sz(24, 80));
-        let (mut snaps, mut snaps_rx) = test_viewer(8, sz(24, 80));
+        let (diffs, mut diffs_rx, _) = test_viewer(8, sz(24, 80));
+        let (mut snaps, mut snaps_rx, _) = test_viewer(8, sz(24, 80));
         snaps.snapshot_mode = true;
-        let (mut paused, mut paused_rx) = test_viewer(8, sz(24, 80));
+        let (mut paused, mut paused_rx, _) = test_viewer(8, sz(24, 80));
         paused.paused = true;
-        let (full, _full_rx) = test_viewer(1, sz(24, 80));
+        let (full, _full_rx, _) = test_viewer(1, sz(24, 80));
         full.data_tx.try_send(snapshot_msg("hawk/0")).unwrap();
         for (id, viewer) in [(1, diffs), (2, snaps), (3, paused), (4, full)] {
             pane.viewers.insert(ClientId(id), viewer);
@@ -2090,106 +2048,114 @@ mod tests {
         app.peer_manager.close_all();
     }
 
-    /// A client's snapshot mode reaches the proxied panes it views, and the
-    /// end of its channel detaches it from them — the last viewer detaching
-    /// the pane upstream — and releases its input lock there, as a local
-    /// daemon does (issue #227).
-    #[tokio::test(start_paused = true)]
-    async fn snapshot_mode_and_a_channels_end_reach_proxied_panes() {
-        let app = Arc::new(crate::fixtures::fixture_app());
-        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
-        let (ctrl, mut answers) = crate::fixtures::make_outbound();
-        let (data_tx, mut data_rx) = mpsc::channel(8);
-        let pane = "fedlocal/0";
-        assert!(app.federated_attach(pane, ClientId(1), data_tx, ctrl.clone(), sz(24, 80)));
-        let bound = Duration::from_secs(60);
-
-        app.set_snapshot_mode(ClientId(1), true).await;
-        peer.send(ServerMessage::SyncReset {
-            pane_id: "fedremote/0".to_string(),
-        })
-        .unwrap();
-        assert!(matches!(
-            tokio::time::timeout(bound, data_rx.recv()).await,
-            Ok(Some(ServerMessage::TerminalSnapshot { .. }))
-        ));
-        // A re-attach keeps the mode.
-        let (data_tx, mut data_rx) = mpsc::channel(8);
-        assert!(app.federated_attach(pane, ClientId(1), data_tx, ctrl.clone(), sz(24, 80)));
-        let _minted = tokio::time::timeout(bound, data_rx.recv()).await;
-        peer.send(ServerMessage::SyncReset {
-            pane_id: "fedremote/0".to_string(),
-        })
-        .unwrap();
-        assert!(matches!(
-            tokio::time::timeout(bound, data_rx.recv()).await,
-            Ok(Some(ServerMessage::TerminalSnapshot { .. }))
-        ));
-
-        app.peer_manager
-            .request_input_lock(&Requester::client(ClientId(1), ctrl.clone()), pane)
-            .unwrap();
-        peer.send(ServerMessage::InputLockGranted {
-            pane_id: "fedremote/0".to_string(),
-        })
-        .unwrap();
-        tokio::time::timeout(bound, answers.recv())
-            .await
-            .expect("granted");
-        while upstream.try_recv().is_ok() {}
-
-        app.detach_channel(ClientId(1), &ctrl).await;
-        let sent: Vec<String> = std::iter::from_fn(|| upstream.try_recv().ok())
+    /// What the hub sent the peer since the last drain, pings aside.
+    fn sent_upstream(hub: &mut Hub) -> Vec<String> {
+        std::iter::from_fn(|| hub.upstream.try_recv().ok())
             .filter(|m| !matches!(m, ClientMessage::Ping { .. }))
             .map(|m| format!("{m:?}"))
-            .collect();
+            .collect()
+    }
+
+    /// The control lane a hub client was answered on.
+    fn ctrl_of(client: &Requester) -> crate::outbound::OutboundTx {
+        match client {
+            Requester::Client { ctrl, .. } => ctrl.clone(),
+            Requester::Hub => panic!("a client, not the hub"),
+        }
+    }
+
+    /// Take `pane`'s input lock for `client` through the peer, returning once
+    /// the grant has reached the client.
+    async fn take_lock(hub: &mut Hub, client: &Requester, answers: &mut OutboundRx) {
+        hub.app
+            .peer_manager
+            .request_input_lock(client, "fedlocal/0")
+            .unwrap();
+        play_peer(hub);
+        tokio::time::timeout(Duration::from_secs(60), answers.recv())
+            .await
+            .expect("granted");
+    }
+
+    /// A client's snapshot mode reaches the proxied panes it views and
+    /// survives a re-attach, as on a local daemon (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_mode_on_a_proxied_pane_survives_a_reattach() {
+        let mut hub = fixture_hub();
+        let (client, _answers, mut data_rx) = viewing_client(&mut hub, 1);
+        let bound = Duration::from_secs(60);
+        let reset = || ServerMessage::SyncReset {
+            pane_id: "fedremote/0".to_string(),
+        };
+
+        hub.app.set_snapshot_mode(ClientId(1), true).await;
+        hub.peer.send(reset()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(bound, data_rx.recv()).await,
+            Ok(Some(ServerMessage::TerminalSnapshot { .. }))
+        ));
+
+        let (data_tx, mut data_rx) = mpsc::channel(8);
+        assert!(hub.app.federated_attach(
+            "fedlocal/0",
+            ClientId(1),
+            data_tx,
+            ctrl_of(&client),
+            sz(24, 80)
+        ));
+        let _minted = tokio::time::timeout(bound, data_rx.recv()).await;
+        hub.peer.send(reset()).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(bound, data_rx.recv()).await,
+            Ok(Some(ServerMessage::TerminalSnapshot { .. }))
+        ));
+    }
+
+    /// The end of a client's channel releases its input lock upstream and
+    /// detaches it — the last viewer detaching the pane upstream (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn a_channels_end_releases_its_lock_and_detaches_the_proxied_pane() {
+        let mut hub = fixture_hub();
+        let (client, mut answers, _data_rx) = viewing_client(&mut hub, 1);
+        take_lock(&mut hub, &client, &mut answers).await;
+        while hub.upstream.try_recv().is_ok() {}
+
+        hub.app.detach_channel(ClientId(1), &ctrl_of(&client)).await;
         assert_eq!(
-            sent,
+            sent_upstream(&mut hub),
             [
                 "ReleaseInputLock { pane_id: \"fedremote/0\" }",
                 "Detach { pane_id: \"fedremote/0\" }"
             ]
         );
         assert!(
-            lock(&app.peer_manager.peers.lock().unwrap()["peer:1"])
+            lock(&hub.app.peer_manager.peers.lock().unwrap()["peer:1"])
                 .panes
                 .is_empty()
         );
+    }
 
-        // A holder whose pane stream closed is dropped as a viewer by the
-        // next frame, but its channel's end still gives the lock back.
-        let (ctrl, mut answers) = crate::fixtures::make_outbound();
-        let (data_tx, data_rx) = mpsc::channel(8);
-        assert!(app.federated_attach(pane, ClientId(2), data_tx, ctrl.clone(), sz(24, 80)));
-        app.peer_manager
-            .request_input_lock(&Requester::client(ClientId(2), ctrl.clone()), pane)
-            .unwrap();
-        // The peer answers every ping it was sent before the grant.
-        while let Ok(msg) = upstream.try_recv() {
-            if let ClientMessage::Ping { seq } = msg {
-                peer.send(ServerMessage::Pong { seq }).unwrap();
-            }
-        }
-        peer.send(ServerMessage::InputLockGranted {
-            pane_id: "fedremote/0".to_string(),
-        })
-        .unwrap();
-        tokio::time::timeout(bound, answers.recv())
-            .await
-            .expect("granted");
+    /// A holder whose pane stream closed is dropped as a viewer by the next
+    /// frame, but its channel's end still gives the lock back.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_whose_stream_closed_releases_its_lock_when_its_channel_ends() {
+        let mut hub = fixture_hub();
+        let (client, mut answers, data_rx) = viewing_client(&mut hub, 2);
+        take_lock(&mut hub, &client, &mut answers).await;
+
         drop(data_rx);
-        peer.send(ServerMessage::SyncReset {
-            pane_id: "fedremote/0".to_string(),
-        })
-        .unwrap();
+        hub.peer
+            .send(ServerMessage::SyncReset {
+                pane_id: "fedremote/0".to_string(),
+            })
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        while upstream.try_recv().is_ok() {}
-        app.detach_channel(ClientId(2), &ctrl).await;
-        let sent: Vec<String> = std::iter::from_fn(|| upstream.try_recv().ok())
-            .filter(|m| !matches!(m, ClientMessage::Ping { .. }))
-            .map(|m| format!("{m:?}"))
-            .collect();
-        assert_eq!(sent, ["ReleaseInputLock { pane_id: \"fedremote/0\" }"]);
+        while hub.upstream.try_recv().is_ok() {}
+        hub.app.detach_channel(ClientId(2), &ctrl_of(&client)).await;
+        assert_eq!(
+            sent_upstream(&mut hub),
+            ["ReleaseInputLock { pane_id: \"fedremote/0\" }"]
+        );
     }
 
     /// Opening a peer that is open already reuses it without dialling. A live

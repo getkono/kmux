@@ -358,6 +358,21 @@ impl GridSnapshot {
 }
 
 #[cfg(test)]
+mod attrs_tests {
+    use super::CellAttrs;
+
+    /// `contains` answers for the flag asked about and no other.
+    #[test]
+    fn cell_attrs_contains_only_the_flags_that_are_set() {
+        let attrs = CellAttrs(CellAttrs::BOLD | CellAttrs::UNDERLINE);
+        assert!(attrs.contains(CellAttrs::BOLD));
+        assert!(attrs.contains(CellAttrs::UNDERLINE));
+        assert!(!attrs.contains(CellAttrs::ITALIC));
+        assert!(!CellAttrs(0).contains(CellAttrs::BOLD));
+    }
+}
+
+#[cfg(test)]
 mod digest_tests {
     use super::*;
 

@@ -1050,32 +1050,79 @@ mod tests {
         out
     }
 
-    // ── ChannelSwitched ─────────────────────────────────────────────────────
+    // ── Ignored messages ────────────────────────────────────────────────────
 
+    /// Arms that exist for exhaustiveness only: each frame is accounted and
+    /// nothing else happens — no UI event, no state change, nothing sent back.
     #[test]
-    fn channel_switched_only_logs_and_changes_no_client_state() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-        let before = observe(&mgr);
-        let transport_before = mgr.current_transport;
+    fn ignored_messages_change_nothing_and_send_nothing() {
+        let cases = [
+            // Log-only is right, even though the protocol doc says "the client
+            // should close the old transport after receiving this". By the time
+            // this arrives the close has already happened:
+            // `drain_transport_upgrades` sends `ChannelReady` on the NEW sender
+            // and then immediately calls `apply_transport_upgrade`, which
+            // replaces `ws_sender` and drops the old one. This arm could not
+            // close anything anyway — a `SessionManager` holds an `mpsc` sender,
+            // never the socket. The doc describes the client's obligation, not
+            // this arm's.
+            (
+                "ChannelSwitched",
+                ServerMessage::ChannelSwitched {
+                    old_transport: "quic".to_string(),
+                },
+            ),
+            // An event a newer daemon added decodes as `Unknown` (protocol 1.1);
+            // it is the only ignored broadcast.
+            (
+                "Event::Unknown",
+                ServerMessage::Event {
+                    event: SessionEventMsg::Unknown,
+                },
+            ),
+            // The bootstrap consumes the challenge before the session manager
+            // runs, so no `AuthProof` is sent from here.
+            (
+                "AuthChallenge",
+                ServerMessage::AuthChallenge {
+                    nonce: vec![1, 2, 3],
+                },
+            ),
+            // The peer's sessions stay listed until the next list drops them.
+            (
+                "PeerClosed",
+                ServerMessage::PeerClosed {
+                    request_id: 17,
+                    peer: "work".to_string(),
+                },
+            ),
+            (
+                "NotifyAccepted",
+                ServerMessage::NotifyAccepted { request_id: 18 },
+            ),
+            (
+                "LogChunk",
+                ServerMessage::LogChunk {
+                    request_id: 19,
+                    data: b"a log line\n".to_vec(),
+                },
+            ),
+            ("LogEnd", ServerMessage::LogEnd { request_id: 19 }),
+        ];
+        for (label, msg) in cases {
+            let (mut mgr, mut rx) = manager_on("eagle");
+            drain(&mut rx);
+            let before = observe(&mgr);
+            let transport_before = mgr.current_transport;
 
-        let events = mgr.handle_server_message(ServerMessage::ChannelSwitched {
-            old_transport: "quic".to_string(),
-        });
+            let events = mgr.handle_server_message(msg);
 
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert_eq!(observe(&mgr), before, "the arm is log-only");
-        assert_eq!(mgr.current_transport, transport_before);
-        // Log-only is right, even though the protocol doc says "the client
-        // should close the old transport after receiving this". By the time this
-        // arrives the close has already happened: `drain_transport_upgrades`
-        // sends `ChannelReady` on the NEW sender and then immediately calls
-        // `apply_transport_upgrade`, which replaces `ws_sender` and drops the old
-        // one. This arm could not close anything anyway — a `SessionManager`
-        // holds an `mpsc` sender, never the socket. The doc describes the
-        // client's obligation, not this arm's.
-        assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
-        assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
+            assert!(events.is_empty(), "{label}: no UI event: {events:?}");
+            assert_eq!(observe(&mgr), before, "{label}: state unchanged");
+            assert_eq!(mgr.current_transport, transport_before, "{label}");
+            assert!(drain(&mut rx).is_empty(), "{label}: nothing sent back");
+            assert_eq!(inbound_msgs(&mgr), 1, "{label}: frame accounted");
+        }
     }
 
     // ── SessionListResult as a resync (issue #208) ──────────────────────────
@@ -2452,149 +2499,96 @@ mod tests {
         );
     }
 
+    /// A broadcast that changes the session tree re-lists — the broadcast
+    /// itself carries no layout — and never moves this client's view (unlike
+    /// the reply arms). Anything this client already knows about sends nothing.
     #[test]
-    fn a_tab_created_event_re_lists_because_the_broadcast_carries_no_layout() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
+    fn tree_broadcasts_re_list_only_when_news_and_never_move_the_view() {
+        let cases = [
+            // The tree can only come from a fresh session list.
+            (
+                "TabCreated, new tab",
+                SessionEventMsg::TabCreated {
+                    word_id: "eagle".to_string(),
+                    tab_index: 1,
+                },
+                true,
+            ),
+            // The requesting client got the whole `TabInfo` in its reply and then
+            // receives the broadcast too; it must not re-list on its own change.
+            (
+                "TabCreated, cached tab",
+                SessionEventMsg::TabCreated {
+                    word_id: "eagle".to_string(),
+                    tab_index: 0,
+                },
+                false,
+            ),
+            // Broadcasts are server-wide, so events arrive for sessions this
+            // client has never listed. Re-listing on each would be a refresh storm.
+            (
+                "TabCreated, untracked session",
+                SessionEventMsg::TabCreated {
+                    word_id: "nosuch".to_string(),
+                    tab_index: 0,
+                },
+                false,
+            ),
+            (
+                "PaneSpawned, tracked session",
+                SessionEventMsg::PaneSpawned {
+                    pane_id: "eagle/1".to_string(),
+                },
+                true,
+            ),
+            // A pane of a session this client has not listed means a session
+            // was created since — possibly by another GUI — so it re-lists too.
+            (
+                "PaneSpawned, unlisted session",
+                SessionEventMsg::PaneSpawned {
+                    pane_id: "otter/0".to_string(),
+                },
+                true,
+            ),
+            (
+                "PaneSpawned, cached pane",
+                SessionEventMsg::PaneSpawned {
+                    pane_id: "eagle/0".to_string(),
+                },
+                false,
+            ),
+            // A restored session surfaces via a fresh list.
+            (
+                "SessionCreated",
+                SessionEventMsg::SessionCreated {
+                    word_id: "otter".to_string(),
+                },
+                true,
+            ),
+        ];
+        for (label, event, relists) in cases {
+            let (mut mgr, mut rx) = manager_on("eagle");
+            drain(&mut rx);
 
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::TabCreated {
-                word_id: "eagle".to_string(),
-                tab_index: 1,
-            },
-        });
+            let events = mgr.handle_server_message(ServerMessage::Event { event });
 
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(
-            drain(&mut rx)
+            assert!(events.is_empty(), "{label}: no UI event: {events:?}");
+            let sent = drain(&mut rx);
+            let lists = sent
                 .iter()
-                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
-            "the tree can only come from a fresh session list"
-        );
-        assert_eq!(
-            mgr.active_tab(),
-            Some(0),
-            "another client's new tab does not yank this client's view"
-        );
-    }
-
-    #[test]
-    fn a_tab_created_event_for_a_tab_already_cached_sends_nothing() {
-        // The requesting client got the whole `TabInfo` in its reply and then
-        // receives the broadcast too; it must not re-list on its own change.
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::TabCreated {
-                word_id: "eagle".to_string(),
-                tab_index: 0,
-            },
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(drain(&mut rx).is_empty(), "no redundant refresh");
-    }
-
-    #[test]
-    fn a_tab_created_event_for_an_untracked_session_sends_nothing() {
-        // Broadcasts are server-wide, so events arrive for sessions this client
-        // has never listed. Re-listing on each would be a refresh storm.
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::TabCreated {
-                word_id: "nosuch".to_string(),
-                tab_index: 0,
-            },
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(drain(&mut rx).is_empty());
-    }
-
-    #[test]
-    fn a_pane_spawned_event_in_a_tracked_session_re_lists() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::PaneSpawned {
-                pane_id: "eagle/1".to_string(),
-            },
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
-            "the new pane's layout can only come from a fresh session list"
-        );
-    }
-
-    /// A pane of a session this client has not listed means a session was
-    /// created since — possibly by another GUI — so it re-lists too.
-    #[test]
-    fn a_pane_spawned_event_in_an_unlisted_session_re_lists() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::PaneSpawned {
-                pane_id: "otter/0".to_string(),
-            },
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
-            "a new session surfaces via a fresh list"
-        );
-        assert_eq!(mgr.active_session(), Some("eagle"), "the view stays put");
-    }
-
-    #[test]
-    fn a_pane_spawned_event_for_a_cached_pane_sends_nothing() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::PaneSpawned {
-                pane_id: "eagle/0".to_string(),
-            },
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(drain(&mut rx).is_empty(), "no redundant refresh");
-    }
-
-    #[test]
-    fn a_session_created_event_re_lists_without_switching_to_it() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::SessionCreated {
-                word_id: "otter".to_string(),
-            },
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
-            "a restored session surfaces via a fresh list"
-        );
-        assert_eq!(
-            mgr.active_session(),
-            Some("eagle"),
-            "unlike the reply arm, the broadcast never switches the view"
-        );
+                .filter(|m| matches!(m, ClientMessage::SessionList { .. }))
+                .count();
+            assert_eq!(
+                (lists, sent.len()),
+                (usize::from(relists), usize::from(relists)),
+                "{label}: re-list expected = {relists}, sent {sent:?}"
+            );
+            assert_eq!(
+                (mgr.active_session(), mgr.active_tab()),
+                (Some("eagle"), Some(0)),
+                "{label}: the view stays put"
+            );
+        }
     }
 
     #[test]
@@ -2624,24 +2618,6 @@ mod tests {
         );
         assert!(mgr.buffer("eagle/0").is_some(), "the grid is not cleared");
         assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
-    }
-
-    #[test]
-    fn an_unknown_event_is_the_only_ignored_broadcast() {
-        // An event a newer daemon added decodes as `Unknown` (protocol 1.1)
-        // and changes nothing here.
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-        let before = observe(&mgr);
-
-        let events = mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::Unknown,
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert_eq!(observe(&mgr), before);
-        assert!(drain(&mut rx).is_empty());
-        assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
     }
 
     // ── Lagged ──────────────────────────────────────────────────────────────
@@ -2930,26 +2906,6 @@ mod tests {
         assert_eq!(mgr.liveness.outstanding_count(), 0);
     }
 
-    // ── AuthChallenge ───────────────────────────────────────────────────────
-
-    #[test]
-    fn auth_challenge_is_ignored_by_the_session_manager() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-        let before = observe(&mgr);
-
-        let events = mgr.handle_server_message(ServerMessage::AuthChallenge {
-            nonce: vec![1, 2, 3],
-        });
-
-        // The bootstrap consumes the challenge before the session manager runs;
-        // the arm exists only for exhaustiveness.
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert_eq!(observe(&mgr), before);
-        assert!(drain(&mut rx).is_empty(), "no AuthProof is sent from here");
-        assert_eq!(inbound_msgs(&mgr), 1);
-    }
-
     // ── ClientListResult / ClientKicked / SessionKicked ─────────────────────
 
     /// One connected-clients row, labelled `user{id}@host`.
@@ -3182,55 +3138,5 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(mgr.status_msg(), "");
-    }
-
-    #[test]
-    fn peer_closed_is_ignored_and_leaves_the_peers_sessions_listed() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-        let before = observe(&mgr);
-
-        let events = mgr.handle_server_message(ServerMessage::PeerClosed {
-            request_id: 17,
-            peer: "work".to_string(),
-        });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert_eq!(observe(&mgr), before);
-        assert!(drain(&mut rx).is_empty());
-        assert_eq!(inbound_msgs(&mgr), 1);
-    }
-
-    // ── NotifyAccepted / LogChunk / LogEnd ──────────────────────────────────
-
-    #[test]
-    fn notify_accepted_is_ignored_by_the_streaming_session_manager() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-        let before = observe(&mgr);
-
-        let events = mgr.handle_server_message(ServerMessage::NotifyAccepted { request_id: 18 });
-
-        assert!(events.is_empty(), "no UI event: {events:?}");
-        assert_eq!(observe(&mgr), before);
-        assert_eq!(inbound_msgs(&mgr), 1);
-    }
-
-    #[test]
-    fn log_chunk_and_log_end_are_ignored_by_the_streaming_session_manager() {
-        let (mut mgr, mut rx) = manager_on("eagle");
-        drain(&mut rx);
-        let before = observe(&mgr);
-
-        let chunk = mgr.handle_server_message(ServerMessage::LogChunk {
-            request_id: 19,
-            data: b"a log line\n".to_vec(),
-        });
-        let end = mgr.handle_server_message(ServerMessage::LogEnd { request_id: 19 });
-
-        assert!(chunk.is_empty(), "no UI event: {chunk:?}");
-        assert!(end.is_empty(), "no UI event: {end:?}");
-        assert_eq!(observe(&mgr), before);
-        assert_eq!(inbound_msgs(&mgr), 2, "both frames are accounted");
     }
 }

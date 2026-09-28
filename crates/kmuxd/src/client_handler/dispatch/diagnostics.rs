@@ -438,24 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn list_directory_reports_error_for_missing_path() {
-        let msg = list_directory(2, "/this/path/does/not/exist/kmux");
-        match msg {
-            ServerMessage::DirectoryListing {
-                path,
-                entries,
-                error,
-                ..
-            } => {
-                assert_eq!(path, "/this/path/does/not/exist/kmux");
-                assert!(entries.is_empty());
-                assert!(error.is_some());
-            }
-            other => panic!("expected DirectoryListing, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn list_directory_empty_path_resolves_a_default() {
         // An empty path resolves to $HOME (or "."); either way it must not error
         // in a normal environment and must echo a canonical, absolute path.
@@ -499,23 +481,22 @@ mod tests {
         }
     }
 
+    /// The protocol doc for `Notify` promises an error when "the pane is
+    /// unknown", and `PaneNotFound` is the code that says so.
     #[tokio::test]
     async fn notify_for_an_unknown_pane_errors_with_the_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::Notify {
-            request_id: 20,
-            pane_id: MISSING_PANE.to_string(),
-            kind: AttentionKind::TurnDone,
-            title: "title".to_string(),
-            body: "body".to_string(),
-        })
+        assert_all_rejected(vec![pane_not_found(
+            "Notify",
+            Some(20),
+            ClientMessage::Notify {
+                request_id: 20,
+                pane_id: MISSING_PANE.to_string(),
+                kind: AttentionKind::TurnDone,
+                title: "title".to_string(),
+                body: "body".to_string(),
+            },
+        )])
         .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(20));
-        // The protocol doc for `Notify` promises an error when "the pane is
-        // unknown", and this is the code that says so.
-        assert_eq!(code, ErrorCode::PaneNotFound);
-        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]

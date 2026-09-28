@@ -141,24 +141,12 @@ impl super::AppCore {
 #[cfg(test)]
 mod tests {
     use super::CursorDebug;
-    use crate::core::AppCore;
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::{ClientCapabilities, CursorShape};
-
-    fn empty_core() -> AppCore {
-        let mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            0,
-            String::new(),
-            true,
-            ClientCapabilities::default(),
-        );
-        AppCore::for_test(mgr)
-    }
+    use crate::fixtures::fixture_core;
+    use kmux_protocol::messages::CursorShape;
 
     #[test]
     fn snapshot_passes_through_context_and_has_no_pane_when_idle() {
-        let core = empty_core();
+        let core = fixture_core();
         let snap = core.render_debug_snapshot(800, 600, 2.0, "wgpu", true);
         assert_eq!(snap.frame_width, 800);
         assert_eq!(snap.frame_height, 600);

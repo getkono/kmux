@@ -173,54 +173,39 @@ mod tests {
         assert_eq!(build_match("abc", "def"), Match3::Differ);
     }
 
+    /// The full protocol x profile truth table: a protocol verdict (mismatch,
+    /// then unknown) takes precedence over any profile verdict.
     #[test]
-    fn attach_block_allows_a_matching_daemon() {
-        assert_eq!(
-            attach_block(Some(PROTOCOL_RANGE), Some(BuildProfile::CURRENT)),
-            None
-        );
-    }
-
-    #[test]
-    fn attach_block_refuses_unknown_protocol() {
-        assert_eq!(
-            attach_block(None, Some(BuildProfile::CURRENT)),
-            Some(BlockReason::ProtocolUnknown)
-        );
-    }
-
-    #[test]
-    fn attach_block_refuses_protocol_mismatch() {
-        assert_eq!(
-            attach_block(
-                Some(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0))),
-                Some(BuildProfile::CURRENT)
-            ),
-            Some(BlockReason::Protocol)
-        );
-    }
-
-    #[test]
-    fn attach_block_refuses_profile_mismatch_and_unknown() {
-        assert_eq!(
-            attach_block(Some(PROTOCOL_RANGE), Some(other_profile())),
-            Some(BlockReason::ProfileMismatch)
-        );
-        assert_eq!(
-            attach_block(Some(PROTOCOL_RANGE), None),
-            Some(BlockReason::ProfileUnknown)
-        );
-        assert_eq!(attach_block(None, None), Some(BlockReason::ProtocolUnknown));
-    }
-
-    #[test]
-    fn attach_block_protocol_takes_precedence_over_profile() {
-        assert_eq!(
-            attach_block(
-                Some(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0))),
-                None
-            ),
-            Some(BlockReason::Protocol)
-        );
+    fn attach_block_lets_through_only_a_matching_protocol_and_profile() {
+        let other_protocol = ProtocolRange::exact(ProtocolVersion::new(2, 0, 0));
+        let protocols = [
+            ("same", Some(PROTOCOL_RANGE)),
+            ("differ", Some(other_protocol)),
+            ("unknown", None),
+        ];
+        let profiles = [
+            ("same", Some(BuildProfile::CURRENT)),
+            ("differ", Some(other_profile())),
+            ("unknown", None),
+        ];
+        let expected = [
+            // profile: same, differ, unknown
+            [
+                None,
+                Some(BlockReason::ProfileMismatch),
+                Some(BlockReason::ProfileUnknown),
+            ],
+            [Some(BlockReason::Protocol); 3],
+            [Some(BlockReason::ProtocolUnknown); 3],
+        ];
+        for ((protocol_label, protocol), row) in protocols.into_iter().zip(expected) {
+            for ((profile_label, profile), want) in profiles.into_iter().zip(row) {
+                assert_eq!(
+                    attach_block(protocol, profile),
+                    want,
+                    "protocol {protocol_label}, profile {profile_label}"
+                );
+            }
+        }
     }
 }

@@ -1137,19 +1137,7 @@ impl FrontendDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::ClientCapabilities;
-
-    fn fixture_core() -> AppCore {
-        let mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            0,
-            String::new(),
-            true,
-            ClientCapabilities::default(),
-        );
-        AppCore::for_test(mgr)
-    }
+    use crate::fixtures::fixture_core;
 
     // ── Automatic reconnect (issue #208) ─────────────────────────────────────
 
@@ -1217,7 +1205,7 @@ mod tests {
             host: String::new(),
             port: 0,
             token: String::new(),
-            capabilities: ClientCapabilities::default(),
+            capabilities: kmux_protocol::messages::ClientCapabilities::default(),
             accept_invalid_certs: false,
             connection_id: ConnectionId(1),
             server_version: None,

@@ -739,57 +739,17 @@ pub(crate) fn apply_hint_to_buffer(buffer: &str, hint: &cmd::hint::Hint) -> Stri
 pub(super) mod testing {
     //! Fixtures shared by every action-handler test module.
 
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::ClientCapabilities;
+    pub(super) use crate::fixtures::fixture_core;
 
     use super::super::AppCore;
 
-    pub(super) fn fixture_core() -> AppCore {
-        let mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            0,
-            String::new(),
-            true,
-            ClientCapabilities::default(),
-        );
-        AppCore::for_test(mgr)
-    }
-
     /// A connected core with one active pane carrying `status` (issue #86 tests).
     pub(super) fn core_with_active_pane(status: kmux_protocol::messages::SessionStatus) -> AppCore {
-        use kmux_protocol::messages::{
-            LayoutNode, PaneInfo, SessionEntry, SessionMeta, TabInfo, TermSize,
-        };
         let mut core = fixture_core();
         core.mgr.connected = true;
-        core.mgr.session_list = vec![SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: "eagle".into(),
-                name: "eagle".into(),
-                cwd: "/".into(),
-            },
-            panes: vec![PaneInfo {
-                pane_id: "eagle/0".into(),
-                pane_index: 0,
-                program: String::new(),
-                size: TermSize::default(),
-                attached_clients: vec![],
-                status,
-                title: String::new(),
-                progress_state: Default::default(),
-                progress: None,
-            }],
-            tabs: vec![TabInfo {
-                tab_index: 0,
-                name: "1".into(),
-                layout: LayoutNode::single(0),
-                focused_pane: 0,
-            }],
-            active_tab: 0,
-            peer: None,
-            peer_unreachable: false,
-        }];
+        let mut entry = crate::fixtures::sample_session_entry("eagle", "/");
+        entry.panes[0].status = status;
+        core.mgr.session_list = vec![entry];
         core.mgr.active_pane = Some("eagle/0".into());
         core
     }

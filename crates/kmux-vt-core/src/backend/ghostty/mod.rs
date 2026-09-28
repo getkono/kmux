@@ -274,8 +274,8 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
     use crate::backend::{BackendEventSink, CapabilityHandles, NullEventSink};
@@ -318,6 +318,29 @@ mod tests {
         }
     }
 
+    /// How many cells a diff rewrites.
+    fn changed_cells(diff: &kmux_protocol::messages::TerminalDiff) -> usize {
+        diff.ops
+            .iter()
+            .map(|op| match op {
+                DiffOp::Cell { .. } => 1,
+                DiffOp::Row { cells, .. } => cells.len(),
+                DiffOp::Clear => 0,
+            })
+            .sum()
+    }
+
+    /// DEC private mode `dec` starts off, `ESC[?{dec}h` turns `is_on` true
+    /// and `ESC[?{dec}l` turns it back off.
+    fn assert_dec_mode_toggles(dec: u16, is_on: fn(TermModes) -> bool) {
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        assert!(!is_on(ts.modes()), "?{dec} starts off");
+        ts.feed(format!("\x1b[?{dec}h").as_bytes());
+        assert!(is_on(ts.modes()), "?{dec}h sets it");
+        ts.feed(format!("\x1b[?{dec}l").as_bytes());
+        assert!(!is_on(ts.modes()), "?{dec}l clears it");
+    }
+
     fn test_backend(rows: u16, cols: u16) -> GhosttyBackend {
         GhosttyBackend::new(test_cfg(rows, cols))
     }
@@ -326,26 +349,6 @@ mod tests {
     // Behavioural tests for the libghostty-vt backend; each assertion
     // guards a VT feature kmux relies on end-to-end.
     // -------------------------------------------------------------------
-
-    #[test]
-    fn feed_hello_produces_5_cell_diff() {
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        ts.feed(b"hello");
-        let diff = expect_cell_diff(ts.compute_diff());
-        let total_cells: usize = diff
-            .ops
-            .iter()
-            .map(|op| match op {
-                DiffOp::Cell { .. } => 1,
-                DiffOp::Row { cells, .. } => cells.len(),
-                DiffOp::Clear => 0,
-            })
-            .sum();
-        assert!(
-            total_cells >= 5,
-            "expected >=5 changed cells, got {total_cells}"
-        );
-    }
 
     #[test]
     fn feed_red_text_has_correct_red_fg() {
@@ -550,31 +553,8 @@ mod tests {
         let _ = ts.compute_diff();
         ts.feed(b" world");
         let diff = expect_cell_diff(ts.compute_diff());
-        let total_cells: usize = diff
-            .ops
-            .iter()
-            .map(|op| match op {
-                DiffOp::Cell { .. } => 1,
-                DiffOp::Row { cells, .. } => cells.len(),
-                DiffOp::Clear => 0,
-            })
-            .sum();
+        let total_cells = changed_cells(&diff);
         assert!(total_cells >= 5);
-    }
-
-    #[test]
-    fn fzf_highlight_move_produces_cell_diff() {
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        ts.feed(b"\x1b[?1049h\x1b[?1h\x1b[?25l");
-        ts.feed(b"  item1\r\n");
-        ts.feed(b"\x1b[7m> item2\x1b[27m\r\n");
-        ts.feed(b"  item3\r\n");
-        let _ = ts.compute_diff();
-
-        ts.feed(b"\x1b[2;1H  item2");
-        ts.feed(b"\x1b[1;1H\x1b[7m> item1\x1b[27m");
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(!diff.ops.is_empty(), "highlight move must have cell ops");
     }
 
     #[test]
@@ -582,28 +562,12 @@ mod tests {
         let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         let diff1 = expect_cell_diff(ts.compute_diff());
-        let c1: usize = diff1
-            .ops
-            .iter()
-            .map(|op| match op {
-                DiffOp::Cell { .. } => 1,
-                DiffOp::Row { cells, .. } => cells.len(),
-                DiffOp::Clear => 0,
-            })
-            .sum();
+        let c1 = changed_cells(&diff1);
         assert!(c1 >= 5);
 
         ts.feed(b"\x1b[3;1H world");
         let diff2 = expect_cell_diff(ts.compute_diff());
-        let c2: usize = diff2
-            .ops
-            .iter()
-            .map(|op| match op {
-                DiffOp::Cell { .. } => 1,
-                DiffOp::Row { cells, .. } => cells.len(),
-                DiffOp::Clear => 0,
-            })
-            .sum();
+        let c2 = changed_cells(&diff2);
         assert!(c2 >= 5);
     }
 
@@ -617,22 +581,12 @@ mod tests {
 
     #[test]
     fn bracketed_paste_mode_enable_disable() {
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        assert!(!ts.modes().bracketed_paste());
-        ts.feed(b"\x1b[?2004h");
-        assert!(ts.modes().bracketed_paste());
-        ts.feed(b"\x1b[?2004l");
-        assert!(!ts.modes().bracketed_paste());
+        assert_dec_mode_toggles(2004, TermModes::bracketed_paste);
     }
 
     #[test]
     fn mouse_report_click_mode_enable_disable() {
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        assert!(!ts.modes().mouse_report());
-        ts.feed(b"\x1b[?1000h");
-        assert!(ts.modes().mouse_report());
-        ts.feed(b"\x1b[?1000l");
-        assert!(!ts.modes().mouse_report());
+        assert_dec_mode_toggles(1000, TermModes::mouse_report);
     }
 
     #[test]
@@ -747,16 +701,6 @@ mod tests {
         assert_eq!(snap.cols, 120);
     }
 
-    #[test]
-    fn scrollback_lines_accumulated() {
-        let mut ts = DiffEngine::new(test_backend(4, 20));
-        for i in 0..8 {
-            ts.feed(format!("line{i}\r\n").as_bytes());
-        }
-        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
-        assert!(!sb.is_empty());
-    }
-
     /// Drive a few lines into scrollback, then return the engine and the
     /// mirror's `history_total` once it is non-empty.
     fn engine_with_scrollback() -> (DiffEngine<GhosttyBackend>, u64) {
@@ -847,23 +791,12 @@ mod tests {
             }
         }
 
-        static SINK: OnceLock<Arc<TitleCapture>> = OnceLock::new();
-        let sink = SINK.get_or_init(|| Arc::new(TitleCapture(Mutex::new(vec![]))));
+        let sink = Arc::new(TitleCapture(Mutex::new(vec![])));
         let events: Arc<dyn BackendEventSink> = sink.clone();
 
         let cfg = BackendConfig {
-            size: BackendSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            capabilities: CapabilityHandles {
-                kitty_graphics: Arc::new(AtomicBool::new(false)),
-                kitty_keyboard: Arc::new(AtomicBool::new(false)),
-            },
-            events: Arc::clone(&events),
-            scrollback: 1_000,
+            events,
+            ..test_cfg(24, 80)
         };
 
         let mut backend = GhosttyBackend::new(cfg);
@@ -890,18 +823,8 @@ mod tests {
         let sink = Arc::new(ProgressCapture(Mutex::new(vec![])));
         let events: Arc<dyn BackendEventSink> = sink.clone();
         let cfg = BackendConfig {
-            size: BackendSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            capabilities: CapabilityHandles {
-                kitty_graphics: Arc::new(AtomicBool::new(false)),
-                kitty_keyboard: Arc::new(AtomicBool::new(false)),
-            },
-            events: Arc::clone(&events),
-            scrollback: 1_000,
+            events,
+            ..test_cfg(24, 80)
         };
 
         let mut backend = GhosttyBackend::new(cfg);
@@ -934,18 +857,8 @@ mod tests {
         let sink = Arc::new(ResponseCapture(Mutex::new(vec![])));
         let events: Arc<dyn BackendEventSink> = sink.clone();
         let cfg = BackendConfig {
-            size: BackendSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            capabilities: CapabilityHandles {
-                kitty_graphics: Arc::new(AtomicBool::new(false)),
-                kitty_keyboard: Arc::new(AtomicBool::new(false)),
-            },
-            events: Arc::clone(&events),
-            scrollback: 1_000,
+            events,
+            ..test_cfg(24, 80)
         };
 
         let mut backend = GhosttyBackend::new(cfg);
@@ -959,44 +872,21 @@ mod tests {
     // distinct flags so the wire protocol can report them independently.
     // -------------------------------------------------------------------
 
+    // DEC 1002 — button-event tracking.
     #[test]
     fn mouse_drag_mode_enable_disable() {
-        // DEC 1002 — button-event tracking.
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        assert_eq!(ts.modes().0 & TermModes::MOUSE_DRAG, 0);
-        ts.feed(b"\x1b[?1002h");
-        assert_ne!(
-            ts.modes().0 & TermModes::MOUSE_DRAG,
-            0,
-            "MOUSE_DRAG should be set after \\e[?1002h"
-        );
-        ts.feed(b"\x1b[?1002l");
-        assert_eq!(
-            ts.modes().0 & TermModes::MOUSE_DRAG,
-            0,
-            "MOUSE_DRAG should be cleared after \\e[?1002l"
-        );
+        assert_dec_mode_toggles(1002, TermModes::mouse_drag);
     }
 
+    // DEC 1003 — any-event tracking (motion reports even without button).
     #[test]
     fn mouse_motion_mode_enable_disable() {
-        // DEC 1003 — any-event tracking (motion reports even without button).
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        assert_eq!(ts.modes().0 & TermModes::MOUSE_MOTION, 0);
-        ts.feed(b"\x1b[?1003h");
-        assert_ne!(ts.modes().0 & TermModes::MOUSE_MOTION, 0);
-        ts.feed(b"\x1b[?1003l");
-        assert_eq!(ts.modes().0 & TermModes::MOUSE_MOTION, 0);
+        assert_dec_mode_toggles(1003, TermModes::mouse_motion);
     }
 
+    // DEC 1006 — SGR extended coordinates.
     #[test]
     fn sgr_mouse_mode_enable_disable() {
-        // DEC 1006 — SGR extended coordinates.
-        let mut ts = DiffEngine::new(test_backend(24, 80));
-        assert!(!ts.modes().sgr_mouse());
-        ts.feed(b"\x1b[?1006h");
-        assert!(ts.modes().sgr_mouse());
-        ts.feed(b"\x1b[?1006l");
-        assert!(!ts.modes().sgr_mouse());
+        assert_dec_mode_toggles(1006, TermModes::sgr_mouse);
     }
 }

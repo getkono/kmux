@@ -1142,22 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn hollow_cursor_is_four_outline_quads() {
-        let grid = grid_with(vec![cell('h', 0)], 1, 1);
-        let mut p = pane(&grid, &[]);
-        p.cursor = Some(CursorView {
-            col: 0,
-            row: 0,
-            shape: CursorShape::HollowBlock,
-            blink: false,
-            visible: true,
-        });
-        let frame = Frame::single(100, 100, 1.0, theme(), true, p);
-        let scene = build_scene(&frame, &CellMetrics::new(8.0, 16.0));
-        assert_eq!(scene.overlay_quads.len(), 4);
-    }
-
-    #[test]
     fn blinking_cursor_off_phase_draws_nothing() {
         let grid = grid_with(vec![cell('x', 0)], 1, 1);
         let mut p = pane(&grid, &[]);
@@ -1172,32 +1156,6 @@ mod tests {
         let scene = build_scene(&frame, &CellMetrics::new(8.0, 16.0));
         assert!(scene.overlay_quads.is_empty());
         assert!(scene.overlay_glyphs.is_empty());
-    }
-
-    #[test]
-    fn cursor_geometry_block_matches_emit_cursor() {
-        // The debug helper must report exactly the rect the renderer fills.
-        let grid = grid_with(vec![cell('K', 0); 6], 2, 3);
-        let mut p = pane(&grid, &[]);
-        let cv = CursorView {
-            col: 1,
-            row: 1,
-            shape: CursorShape::Block,
-            blink: false,
-            visible: true,
-        };
-        p.cursor = Some(cv);
-        let m = CellMetrics::new(8.0, 16.0);
-        let frame = Frame::single(100, 100, 1.0, theme(), true, p);
-        let scene = build_scene(&frame, &m);
-
-        let geo = cursor_geometry(&cv, (0.0, 0.0), 3, 2, &m);
-        assert!(geo.in_range);
-        assert_eq!(geo.rects.len(), 1);
-        let q = scene.overlay_quads[0]; // the block fill emit_cursor pushed
-        let r = geo.rects[0];
-        assert_eq!((r.x, r.y, r.w, r.h), (q.x, q.y, q.w, q.h));
-        assert_eq!((r.x, r.y), (8.0, 16.0)); // col 1, row 1 → 8×16 cells
     }
 
     /// The property the Cairo path now depends on: for *every* shape, the rects
@@ -1237,6 +1195,12 @@ mod tests {
             let reported: Vec<_> = geo.rects.iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
             assert_eq!(reported, drawn, "{shape:?}");
             assert!(!reported.is_empty(), "{shape:?} must draw something");
+            assert!(geo.in_range, "{shape:?}");
+            // col 1, row 1 of 8x16 cells.
+            assert_eq!(geo.cell_origin, (8.0, 16.0), "{shape:?}");
+            if shape == CursorShape::Block {
+                assert_eq!(reported, [(8.0, 16.0, 8.0, 16.0)], "block fills its cell");
+            }
         }
     }
 

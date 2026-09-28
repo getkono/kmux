@@ -415,27 +415,28 @@ pub(super) fn fail_in_flight(conn: &mut PeerConnection) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod testing {
     //! A hub proxying `fedlocal` from a peer played over channels
-    //! (`install_channel_peer`, on the paused clock): what goes up the link,
-    //! and what each client is answered.
+    //! (`install_channel_peer`), shared by the federation tests.
 
-    use kmux_protocol::messages::{ClientId, LayoutNode, RequestId, TabInfo, TermSize};
+    use std::sync::Arc;
+
+    use kmux_protocol::messages::{ClientId, ClientMessage, ServerMessage, TermSize};
     use tokio::sync::mpsc;
 
-    use super::*;
-    use crate::federation::link::testing::{WAIT, next_upstream};
+    use super::Requester;
+    use crate::app::ServerApp;
     use crate::fixtures::{fixture_app, make_outbound};
     use crate::outbound::OutboundRx;
 
     /// The hub, what it sends the peer, and the sender that plays the peer.
-    struct Hub {
-        app: Arc<ServerApp>,
-        upstream: mpsc::UnboundedReceiver<ClientMessage>,
-        peer: mpsc::UnboundedSender<ServerMessage>,
+    pub(crate) struct Hub {
+        pub(crate) app: Arc<ServerApp>,
+        pub(crate) upstream: mpsc::UnboundedReceiver<ClientMessage>,
+        pub(crate) peer: mpsc::UnboundedSender<ServerMessage>,
     }
 
-    fn fixture_hub() -> Hub {
+    pub(crate) fn fixture_hub() -> Hub {
         let app = Arc::new(fixture_app());
         let (upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
         Hub {
@@ -445,16 +446,10 @@ mod tests {
         }
     }
 
-    /// A client of the hub, and its control lane.
-    fn client(id: u64) -> (Requester, OutboundRx) {
-        let (ctrl, rx) = make_outbound();
-        (Requester::client(ClientId(id), ctrl), rx)
-    }
-
     /// Play the peer for everything the hub has sent it so far, in order, as
     /// a daemon answers one connection: each ping answered, each lock request
     /// granted, each release confirmed.
-    fn play_peer(hub: &mut Hub) {
+    pub(crate) fn play_peer(hub: &mut Hub) {
         while let Ok(msg) = hub.upstream.try_recv() {
             let reply = match msg {
                 ClientMessage::Ping { seq } => ServerMessage::Pong { seq },
@@ -472,7 +467,7 @@ mod tests {
 
     /// A client of the hub viewing `fedlocal/0`, its control lane, and its
     /// pane stream; the peer has played what its attach sent.
-    fn viewing_client(
+    pub(crate) fn viewing_client(
         hub: &mut Hub,
         id: u64,
     ) -> (Requester, OutboundRx, mpsc::Receiver<ServerMessage>) {
@@ -487,6 +482,28 @@ mod tests {
         ));
         play_peer(hub);
         (Requester::client(ClientId(id), ctrl), rx, data_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A hub proxying `fedlocal` from a peer played over channels
+    //! (`install_channel_peer`, on the paused clock): what goes up the link,
+    //! and what each client is answered.
+
+    use kmux_protocol::messages::{ClientId, LayoutNode, RequestId, TabInfo, TermSize};
+    use tokio::sync::mpsc;
+
+    use super::testing::{fixture_hub, play_peer, viewing_client};
+    use super::*;
+    use crate::federation::link::testing::{WAIT, next_upstream};
+    use crate::fixtures::make_outbound;
+    use crate::outbound::OutboundRx;
+
+    /// A client of the hub, and its control lane.
+    fn client(id: u64) -> (Requester, OutboundRx) {
+        let (ctrl, rx) = make_outbound();
+        (Requester::client(ClientId(id), ctrl), rx)
     }
 
     /// The next thing the hub sends the peer that is not a ping.

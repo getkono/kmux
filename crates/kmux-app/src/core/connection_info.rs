@@ -119,21 +119,13 @@ impl AppCore {
 
 #[cfg(test)]
 mod tests {
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::{ClientCapabilities, PROTOCOL_RANGE};
+    use kmux_protocol::messages::PROTOCOL_RANGE;
 
-    use crate::core::AppCore;
+    use crate::fixtures::fixture_core;
 
     #[test]
     fn connection_info_reports_protocol_and_transport() {
-        let mgr = SessionManager::new(
-            "10.0.0.2".into(),
-            8443,
-            "tok".into(),
-            false,
-            ClientCapabilities::default(),
-        );
-        let core = AppCore::for_test(mgr);
+        let core = fixture_core();
         let info = core.connection_info();
         // Protocol version is always the compiled-in wire version.
         assert_eq!(info.protocol_version, PROTOCOL_RANGE.to_string());

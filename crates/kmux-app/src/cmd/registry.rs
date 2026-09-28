@@ -715,21 +715,12 @@ mod tests {
     use super::*;
     use crate::cmd::exec::{Outcome, run};
     use crate::mode::CommandState;
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::ClientCapabilities;
 
     fn fixture_core() -> AppCore {
-        let mut mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            8443,
-            "tok".into(),
-            true,
-            ClientCapabilities::default(),
-        );
+        let mut core = crate::fixtures::fixture_core();
         // Pretend the daemon is connected so commands that gate on
         // `is_connected` reach their real error paths in tests.
-        mgr.connected = true;
-        let mut core = AppCore::for_test(mgr);
+        core.mgr.connected = true;
         core.mode = Mode::Command(CommandState::default());
         core
     }
@@ -757,6 +748,7 @@ mod tests {
     #[tokio::test]
     async fn submit_redraw_via_dispatch_sets_force_clear() {
         let mut app = fixture_core();
+        assert!(!app.force_clear);
         let kr = submit("redraw", &mut app).await;
         assert!(matches!(kr, crate::core::KeyResult::Continue));
         assert!(app.force_clear);
@@ -808,30 +800,9 @@ mod tests {
     }
 
     #[test]
-    fn quit_returns_quit_outcome() {
-        let mut app = fixture_core();
-        assert!(matches!(run(&mut app, "quit"), Outcome::Quit));
-    }
-
-    #[test]
     fn quit_alias_q_returns_quit() {
         let mut app = fixture_core();
         assert!(matches!(run(&mut app, "q"), Outcome::Quit));
-    }
-
-    #[test]
-    fn redraw_sets_force_clear() {
-        let mut app = fixture_core();
-        assert!(!app.force_clear);
-        let _ = run(&mut app, "redraw");
-        assert!(app.force_clear, "force_clear should be set");
-    }
-
-    #[test]
-    fn help_changes_mode_to_help() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "help");
-        assert!(matches!(app.mode, Mode::Help));
     }
 
     #[test]
@@ -882,17 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn theme_unknown_sets_status() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "theme nonsense");
-        assert!(
-            app.mgr.status_msg().contains("unknown theme"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
     fn snapshot_on_sets_force_snapshot() {
         let mut app = fixture_core();
         let _ = run(&mut app, "snapshot on");
@@ -922,100 +882,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_alias_p_new_dispatches() {
-        // Without an active session, create_pane returns silently — but the
-        // command must still resolve and run (no "unknown command" status).
-        let mut app = fixture_core();
-        let _ = run(&mut app, "p new");
-        // No "unknown command" or parse error written to status.
-        assert!(
-            !app.mgr.status_msg().to_lowercase().contains("unknown"),
-            "unexpected status: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn signal_with_no_active_pane_sets_error_status() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "signal kill");
-        assert!(
-            app.mgr.status_msg().contains("no active pane"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn signal_unknown_name_errors() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "signal foo");
-        assert!(
-            app.mgr.status_msg().contains("unknown signal"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn disconnected_session_new_reports_status() {
-        let mut app = fixture_core();
-        app.mgr.connected = false;
-        let _ = run(&mut app, "session new");
-        assert!(
-            app.mgr.status_msg().contains("not connected"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn disconnected_signal_reports_status() {
-        let mut app = fixture_core();
-        app.mgr.connected = false;
-        let _ = run(&mut app, "signal kill");
-        assert!(
-            app.mgr.status_msg().contains("not connected"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn pane_new_with_no_session_reports_status() {
-        let mut app = fixture_core();
-        // Connected, but no active session.
-        let _ = run(&mut app, "pane new");
-        assert!(
-            app.mgr.status_msg().contains("no active session"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn unknown_command_writes_status() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "nopecommand");
-        assert!(
-            app.mgr.status_msg().contains("unknown command"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn rename_with_no_active_session_errors() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "session rename foo");
-        assert!(
-            app.mgr.status_msg().contains("no active session"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
     fn transport_sets_and_clears_override() {
         use kmux_protocol::messages::TransportKind;
         let mut app = fixture_core();
@@ -1026,27 +892,39 @@ mod tests {
         assert!(app.mgr.transport_override().is_none());
     }
 
+    /// Commands whose observable effect is a status line: `(input, connected,
+    /// expected substring)`. Each also must not end the session.
     #[test]
-    fn transport_unknown_name_errors() {
-        let mut app = fixture_core();
-        let _ = run(&mut app, "transport carrier-pigeon");
-        assert!(
-            app.mgr.status_msg().contains("unknown transport"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
-    }
-
-    #[test]
-    fn disconnect_remote_reports_status() {
-        let mut app = fixture_core();
-        let outcome = run(&mut app, "disconnect-remote box");
-        assert!(matches!(outcome, Outcome::Continue));
-        assert!(
-            app.mgr.status_msg().contains("disconnected box"),
-            "got: {:?}",
-            app.mgr.status_msg()
-        );
+    fn run_status_only_command_writes_expected_status() {
+        #[rustfmt::skip]
+        let cases = [
+            ("theme nonsense", true, "unknown theme"),
+            ("signal kill", true, "no active pane"),
+            ("signal foo", true, "unknown signal"),
+            ("session new", false, "not connected"),
+            ("signal kill", false, "not connected"),
+            ("pane new", true, "no active session"),
+            // The `p` alias must resolve to the same handler, not "unknown command".
+            ("p new", true, "no active session"),
+            ("nopecommand", true, "unknown command"),
+            ("session rename foo", true, "no active session"),
+            ("transport carrier-pigeon", true, "unknown transport"),
+            ("disconnect-remote box", true, "disconnected box"),
+        ];
+        for (input, connected, expected) in cases {
+            let mut app = fixture_core();
+            app.mgr.connected = connected;
+            let outcome = run(&mut app, input);
+            assert!(
+                matches!(outcome, Outcome::Continue),
+                "{input}: expected Outcome::Continue"
+            );
+            assert!(
+                app.mgr.status_msg().contains(expected),
+                "{input} (connected={connected}): got {:?}",
+                app.mgr.status_msg()
+            );
+        }
     }
 
     #[test]

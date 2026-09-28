@@ -291,26 +291,56 @@ mod tests {
         },
     }
 
+    /// Every `ClientMessage` variant survives the wire: what decodes from its
+    /// bytes is the message that was sent (compared through `Debug`, as
+    /// `ClientMessage` is not `PartialEq`) and re-encodes to the same bytes.
+    /// Beyond one sample per variant (`every_client_message`,
+    /// whose completeness `spec` checks), the extra cases set the optional and
+    /// sized fields a dropped field would silently reset to their default.
     #[test]
-    fn roundtrip_client_auth() {
-        let msg = ClientMessage::Auth {
-            token: "secret".to_string(),
-            protocol_range: PROTOCOL_RANGE,
-            protocol_capabilities: protocol_capabilities(),
-            capabilities: ClientCapabilities::default(),
-            connection_id: None,
-            resume_instance: None,
-            public_key: vec![1, 2, 3],
-            hostname: "host".to_string(),
-            username: "user".to_string(),
-            client_kind: FrontendKind::Cli,
-            client_git_sha: String::new(),
-            client_git_dirty: false,
-            client_build_profile: String::new(),
+    fn every_client_message_survives_the_wire() {
+        let size = TermSize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 1056,
+            pixel_height: 640,
         };
-        let bytes = encode_client(&msg).expect("encode");
-        let decoded = decode_client(&bytes).expect("decode");
-        assert!(matches!(decoded, ClientMessage::Auth { token, .. } if token == "secret"));
+        let non_default = [
+            ClientMessage::SessionCreate {
+                request_id: 42,
+                name: Some("my-session".into()),
+                cwd: Some("/srv/app".into()),
+                program: Some("/bin/bash".into()),
+                args: vec!["-l".into()],
+                size,
+                peer: Some("10.0.0.5:8443".into()),
+            },
+            ClientMessage::Notify {
+                request_id: 7,
+                pane_id: "eagle/0".into(),
+                kind: AttentionKind::NeedsInput,
+                title: "Claude".into(),
+                body: "needs your input".into(),
+            },
+            ClientMessage::Attach {
+                pane_id: "eagle/0".into(),
+                last_seqno: Some(SequenceNo(100)),
+                size,
+            },
+        ];
+        // `ClientMessage` has no `PartialEq`, so the decoded value is compared
+        // through `Debug`: re-encoding alone would pass a field that encode
+        // and decode both drop, since it decodes to its default every time.
+        for msg in every_client_message().into_iter().chain(non_default) {
+            let bytes = encode_client(&msg).expect("encode");
+            let decoded = decode_client(&bytes).expect("decode");
+            assert_eq!(format!("{decoded:?}"), format!("{msg:?}"));
+            assert_eq!(
+                encode_client(&decoded).expect("re-encode"),
+                bytes,
+                "{msg:?}"
+            );
+        }
     }
 
     #[test]
@@ -375,53 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_client_session_create() {
-        let msg = ClientMessage::SessionCreate {
-            request_id: 42,
-            name: Some("my-session".to_string()),
-            cwd: None,
-            program: Some("/bin/bash".to_string()),
-            args: vec![],
-            size: TermSize {
-                rows: 40,
-                cols: 120,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            peer: None,
-        };
-        let bytes = encode_client(&msg).expect("encode");
-        let decoded = decode_client(&bytes).expect("decode");
-        assert!(
-            matches!(&decoded, ClientMessage::SessionCreate { request_id: 42, name, .. }
-                if name.as_deref() == Some("my-session"))
-        );
-    }
-
-    #[test]
-    fn roundtrip_client_session_create_on_peer() {
-        // The peer target must survive the wire roundtrip so the hub
-        // can route the create to a federated remote (issue #121).
-        let msg = ClientMessage::SessionCreate {
-            request_id: 7,
-            name: None,
-            cwd: Some("/srv/app".to_string()),
-            program: None,
-            args: vec![],
-            size: TermSize::default(),
-            peer: Some("10.0.0.5:8443".to_string()),
-        };
-        let bytes = encode_client(&msg).expect("encode");
-        match decode_client(&bytes).expect("decode") {
-            ClientMessage::SessionCreate { peer, cwd, .. } => {
-                assert_eq!(peer.as_deref(), Some("10.0.0.5:8443"));
-                assert_eq!(cwd.as_deref(), Some("/srv/app"));
-            }
-            other => panic!("expected SessionCreate, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn roundtrip_server_error() {
         let msg = ServerMessage::Error {
             request_id: Some(1),
@@ -437,96 +420,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn roundtrip_client_notify() {
-        let msg = ClientMessage::Notify {
-            request_id: 7,
-            pane_id: "eagle/0".to_string(),
-            kind: AttentionKind::NeedsInput,
-            title: "Claude".to_string(),
-            body: "needs your input".to_string(),
-        };
-        let bytes = encode_client(&msg).expect("encode");
-        let decoded = decode_client(&bytes).expect("decode");
-        assert!(matches!(
-            &decoded,
-            ClientMessage::Notify { kind: AttentionKind::NeedsInput, pane_id, .. }
-                if pane_id == "eagle/0"
-        ));
-    }
-
-    #[test]
-    fn roundtrip_pane_attention_event() {
-        let msg = ServerMessage::Event {
-            event: SessionEventMsg::PaneAttention {
-                pane_id: "eagle/0".to_string(),
-                kind: AttentionKind::TurnDone,
-                title: "Claude".to_string(),
-                body: "finished a turn".to_string(),
-                attention_id: 42,
-            },
-        };
-        let bytes = encode_server(&msg).expect("encode");
-        let decoded = decode_server(&bytes).expect("decode");
-        assert!(matches!(
-            &decoded,
-            ServerMessage::Event {
-                event: SessionEventMsg::PaneAttention {
-                    kind: AttentionKind::TurnDone,
-                    attention_id: 42,
-                    ..
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn roundtrip_client_attach_with_seqno() {
-        let msg = ClientMessage::Attach {
-            pane_id: "eagle/0".to_string(),
-            last_seqno: Some(SequenceNo(100)),
-            size: TermSize::default(),
-        };
-        let bytes = encode_client(&msg).expect("encode");
-        let decoded = decode_client(&bytes).expect("decode");
-        assert!(
-            matches!(&decoded, ClientMessage::Attach { pane_id, last_seqno: Some(SequenceNo(100)), .. }
-                if pane_id == "eagle/0")
-        );
-    }
-
-    #[test]
-    fn attach_roundtrip_with_size() {
-        let size = TermSize {
-            rows: 40,
-            cols: 132,
-            pixel_width: 1056,
-            pixel_height: 640,
-        };
-        let msg = ClientMessage::Attach {
-            pane_id: "eagle/0".to_string(),
-            last_seqno: None,
-            size,
-        };
-        let bytes = encode_client(&msg).expect("encode");
-        let decoded = decode_client(&bytes).expect("decode");
-        match decoded {
-            ClientMessage::Attach {
-                pane_id,
-                last_seqno,
-                size: decoded_size,
-            } => {
-                assert_eq!(pane_id, "eagle/0");
-                assert!(last_seqno.is_none());
-                assert_eq!(decoded_size.rows, 40);
-                assert_eq!(decoded_size.cols, 132);
-                assert_eq!(decoded_size.pixel_width, 1056);
-                assert_eq!(decoded_size.pixel_height, 640);
-            }
-            _ => panic!("expected Attach"),
-        }
     }
 
     #[test]
@@ -556,40 +449,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn roundtrip_terminal_diff() {
-        let diff = TerminalDiff {
-            ops: vec![
-                DiffOp::Cell {
-                    row: 0,
-                    col: 5,
-                    cell: CellState::default(),
-                },
-                DiffOp::Row {
-                    row: 1,
-                    start_col: 0,
-                    cells: vec![CellState::default(); 3],
-                },
-                DiffOp::Clear,
-            ],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-            history_total: 0,
-            scrollback_reset: None,
-        };
-        let msg = ServerMessage::TerminalUpdate {
-            pane_id: "eagle/0".to_string(),
-            diff: std::sync::Arc::new(diff),
-            seqno: SequenceNo(1),
-            sent_at_ms: 0,
-        };
-        let bytes = encode_server(&msg).expect("encode");
-        let decoded = decode_server(&bytes).expect("decode");
-        assert!(
-            matches!(&decoded, ServerMessage::TerminalUpdate { pane_id, .. } if pane_id == "eagle/0")
-        );
     }
 
     /// The largest legitimate frame is a `TerminalSnapshot`: a full grid plus
@@ -679,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_cell_state_with_attrs() {
+    fn roundtrip_terminal_diff_with_cell_attrs() {
         let cell = CellState {
             c: 'X',
             fg: CellColor::new(255, 0, 0),
@@ -687,11 +546,19 @@ mod tests {
             attrs: CellAttrs(CellAttrs::BOLD | CellAttrs::UNDERLINE),
         };
         let diff = TerminalDiff {
-            ops: vec![DiffOp::Cell {
-                row: 0,
-                col: 0,
-                cell,
-            }],
+            ops: vec![
+                DiffOp::Cell {
+                    row: 0,
+                    col: 0,
+                    cell,
+                },
+                DiffOp::Row {
+                    row: 1,
+                    start_col: 0,
+                    cells: vec![CellState::default(); 3],
+                },
+                DiffOp::Clear,
+            ],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
@@ -705,19 +572,16 @@ mod tests {
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");
-        match decoded {
-            ServerMessage::TerminalUpdate { diff, .. } => {
-                if let DiffOp::Cell { cell, .. } = &diff.ops[0] {
-                    assert_eq!(cell.c, 'X');
-                    assert!(cell.attrs.contains(CellAttrs::BOLD));
-                    assert!(cell.attrs.contains(CellAttrs::UNDERLINE));
-                    assert!(!cell.attrs.contains(CellAttrs::ITALIC));
-                } else {
-                    panic!("expected Cell op");
-                }
-            }
-            _ => panic!("expected TerminalUpdate"),
-        }
+        let ServerMessage::TerminalUpdate { pane_id, diff, .. } = &decoded else {
+            panic!("expected TerminalUpdate, got {decoded:?}");
+        };
+        assert_eq!(pane_id, "eagle/0");
+        let DiffOp::Cell { cell: got, .. } = &diff.ops[0] else {
+            panic!("expected Cell op, got {:?}", diff.ops[0]);
+        };
+        assert_eq!(*got, cell);
+        // The `Row` and `Clear` ops survive too.
+        assert_eq!(encode_server(&decoded).expect("re-encode"), bytes);
     }
 }
 
@@ -755,20 +619,6 @@ mod framing_tests {
         let mut cursor = std::io::Cursor::new(bytes);
         let result = read_frame(&mut cursor).await;
         assert!(matches!(result, Err(ProtocolError::FrameTooLarge { .. })));
-    }
-
-    #[tokio::test]
-    async fn frame_server_message_roundtrip() {
-        let msg = ServerMessage::Pong { seq: 42 };
-        let payload = encode_server(&msg).expect("encode");
-
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &payload).await.expect("write");
-
-        let mut cursor = std::io::Cursor::new(buf);
-        let frame = read_frame(&mut cursor).await.expect("read").unwrap();
-        let decoded = decode_server(&frame).expect("decode");
-        assert!(matches!(decoded, ServerMessage::Pong { seq: 42 }));
     }
 
     /// A compressible payload above the threshold is stored zstd-tagged and the

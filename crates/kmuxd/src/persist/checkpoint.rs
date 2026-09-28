@@ -364,6 +364,7 @@ mod tests {
 
         let decoded = read_back(&path);
         assert_eq!(decoded.version, STATE_VERSION);
+        assert_eq!(decoded.session_index_counter, 1);
         assert_eq!(decoded.used_words, vec!["eagle"]);
         assert_eq!(decoded.sessions[0].meta.word_id, "eagle");
     }

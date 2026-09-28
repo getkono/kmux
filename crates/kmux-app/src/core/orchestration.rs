@@ -922,19 +922,7 @@ fn join_path(base: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::ClientCapabilities;
-
-    fn fixture_core() -> AppCore {
-        let mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            0,
-            String::new(),
-            true,
-            ClientCapabilities::default(),
-        );
-        AppCore::for_test(mgr)
-    }
+    use crate::fixtures::fixture_core;
 
     #[test]
     fn current_target_is_always_local_even_with_a_desired_peer() {
@@ -1419,57 +1407,36 @@ mod tests {
         }
     }
 
+    /// OSC 52 is honoured only from a pane of the session being viewed
+    /// (last-in-wins across its splits): the daemon broadcasts it server-wide,
+    /// so another session must not clobber the clipboard.
     #[test]
-    fn osc52_from_active_session_decodes_to_clipboard_effect() {
-        // "aGVsbG8=" is base64 for "hello". Active session is "eagle".
-        let eff = osc52_clipboard_effect(Some("eagle"), "eagle/0", "c", "aGVsbG8=");
-        match eff {
-            Some(KeyResult::CopyToClipboard(text)) => assert_eq!(text, "hello"),
-            _ => panic!("expected CopyToClipboard"),
+    fn osc52_clipboard_effect_honours_only_the_viewed_session() {
+        // "aGVsbG8=" is base64 for "hello".
+        #[rustfmt::skip]
+        let cases = [
+            ("active session", Some("eagle"), "eagle/0", "aGVsbG8=", Some("hello")),
+            ("non-focused split of active session", Some("eagle"), "eagle/3", "aGVsbG8=", Some("hello")),
+            ("other session", Some("eagle"), "falcon/0", "aGVsbG8=", None),
+            ("no active session", None, "eagle/0", "aGVsbG8=", None),
+            ("malformed pane id", Some("eagle"), "eagle", "aGVsbG8=", None),
+            ("invalid base64", Some("eagle"), "eagle/0", "not valid base64!", None),
+        ];
+        for (label, active, pane_id, data, expected) in cases {
+            let copied = match osc52_clipboard_effect(active, pane_id, "c", data) {
+                Some(KeyResult::CopyToClipboard(text)) => Some(text),
+                None => None,
+                Some(_) => panic!("{label}: expected CopyToClipboard or None"),
+            };
+            assert_eq!(copied.as_deref(), expected, "{label}");
         }
-    }
-
-    #[test]
-    fn osc52_from_non_focused_pane_in_active_session_is_honored() {
-        // Last-in-wins: a copy from a non-focused split in the session you are
-        // viewing still updates the clipboard (the bug this fix addresses — the
-        // old active-pane gate silently dropped it).
-        let eff = osc52_clipboard_effect(Some("eagle"), "eagle/3", "c", "aGVsbG8=");
-        match eff {
-            Some(KeyResult::CopyToClipboard(text)) => assert_eq!(text, "hello"),
-            _ => panic!("expected CopyToClipboard"),
-        }
-    }
-
-    #[test]
-    fn osc52_from_other_session_is_ignored() {
-        // A pane in a session you are NOT viewing cannot clobber the clipboard,
-        // since the daemon broadcasts OSC 52 server-wide.
-        let eff = osc52_clipboard_effect(Some("eagle"), "falcon/0", "c", "aGVsbG8=");
-        assert!(eff.is_none());
-
-        // No active session at all is likewise ignored.
-        let eff = osc52_clipboard_effect(None, "eagle/0", "c", "aGVsbG8=");
-        assert!(eff.is_none());
-
-        // A malformed pane_id (no `/`) is ignored.
-        let eff = osc52_clipboard_effect(Some("eagle"), "eagle", "c", "aGVsbG8=");
-        assert!(eff.is_none());
-    }
-
-    #[test]
-    fn osc52_invalid_base64_is_ignored() {
-        let eff = osc52_clipboard_effect(Some("eagle"), "eagle/0", "c", "not valid base64!");
-        assert!(eff.is_none());
     }
 
     // ── Directory browser ────────────────────────────────────────────────────
 
+    use crate::fixtures::sample_session_entry;
     use crate::mode::Action;
-    use kmux_protocol::messages::{
-        ClientMessage, DirEntry, LayoutNode, PaneInfo, SessionMeta, SessionStatus, TabInfo,
-        TermSize,
-    };
+    use kmux_protocol::messages::{ClientMessage, DirEntry, SessionMeta};
     use tokio::sync::mpsc::UnboundedReceiver;
 
     /// A core whose manager has a live sender, so sent `ClientMessage`s can be
@@ -1483,34 +1450,19 @@ mod tests {
         (core, rx)
     }
 
-    fn entry(word_id: &str, cwd: &str) -> SessionEntry {
-        SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: word_id.into(),
-                name: word_id.into(),
-                cwd: cwd.into(),
-            },
-            panes: vec![PaneInfo {
-                pane_id: format!("{word_id}/0"),
-                pane_index: 0,
-                program: String::new(),
-                size: TermSize::default(),
-                attached_clients: vec![],
-                status: SessionStatus::Running,
-                title: String::new(),
-                progress_state: Default::default(),
-                progress: None,
-            }],
-            tabs: vec![TabInfo {
-                tab_index: 0,
-                name: "1".into(),
-                layout: LayoutNode::single(0),
-                focused_pane: 0,
-            }],
-            active_tab: 0,
-            peer: None,
-            peer_unreachable: false,
+    /// The path of the `ListDirectory` request that must be next on `rx`.
+    fn expect_list_directory(rx: &mut UnboundedReceiver<ClientMessage>) -> String {
+        match rx.try_recv().expect("a listing was requested") {
+            ClientMessage::ListDirectory { path, .. } => path,
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    /// The cwd of the `SessionCreate` that must be next on `rx`.
+    fn expect_session_create(rx: &mut UnboundedReceiver<ClientMessage>) -> Option<String> {
+        match rx.try_recv().expect("a session create was sent") {
+            ClientMessage::SessionCreate { cwd, .. } => cwd,
+            other => panic!("expected SessionCreate, got {other:?}"),
         }
     }
 
@@ -1543,7 +1495,7 @@ mod tests {
         core.initial_cwd = "/fallback".into();
         core.mgr
             .session_list
-            .push(entry("eagle", "/home/user/proj"));
+            .push(sample_session_entry("eagle", "/home/user/proj"));
         core.mgr.select_session("eagle".into());
         while rx.try_recv().is_ok() {}
 
@@ -1552,10 +1504,7 @@ mod tests {
         assert_eq!(core.mode, Mode::DirectoryPicker);
         assert_eq!(core.dir_browser_cwd, "/home/user/proj");
         assert!(core.dir_picker_buffer.is_empty());
-        match rx.try_recv().expect("a listing was requested") {
-            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/home/user/proj"),
-            other => panic!("expected ListDirectory, got {other:?}"),
-        }
+        assert_eq!(expect_list_directory(&mut rx), "/home/user/proj");
     }
 
     #[test]
@@ -1566,10 +1515,7 @@ mod tests {
         core.open_directory_browser();
 
         assert_eq!(core.dir_browser_cwd, "/fallback");
-        match rx.try_recv().expect("a listing was requested") {
-            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/fallback"),
-            other => panic!("expected ListDirectory, got {other:?}"),
-        }
+        assert_eq!(expect_list_directory(&mut rx), "/fallback");
     }
 
     #[test]
@@ -1657,73 +1603,32 @@ mod tests {
         core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::Normal);
-        match rx.try_recv().expect("a session create was sent") {
-            ClientMessage::SessionCreate { cwd, .. } => {
-                assert_eq!(cwd.as_deref(), Some("/srv/app"));
-            }
-            other => panic!("expected SessionCreate, got {other:?}"),
-        }
+        assert_eq!(expect_session_create(&mut rx).as_deref(), Some("/srv/app"));
     }
 
+    /// Submitting a navigation row (or an unmatched typed absolute path while
+    /// `CreateHere` is selected) keeps the browser open and lists the new dir.
+    /// Rows for a `/home/user` listing: 0 `CreateHere`, 1 `Up`, 2 `dev`.
     #[test]
-    fn submit_subdir_requests_new_listing_and_keeps_browser_open() {
-        let (mut core, mut rx) = connected_core();
-        core.open_directory_browser();
-        deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
-        while rx.try_recv().is_ok() {}
+    fn dir_picker_submit_navigation_relists_and_keeps_browser_open() {
+        let cases = [
+            ("subdir row", 2, "", "/home/user/dev"),
+            ("up row", 1, "", "/home"),
+            ("typed unmatched absolute path", 0, "/var/log", "/var/log"),
+        ];
+        for (label, selected, typed, expected) in cases {
+            let (mut core, mut rx) = connected_core();
+            core.open_directory_browser();
+            deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
+            while rx.try_recv().is_ok() {}
 
-        // Select the "dev" Enter row (row 2: CreateHere, Up, dev) and submit.
-        core.dir_picker_selected = 2;
-        core.dispatch_action(Action::DirPickerSubmit);
+            core.dir_picker_selected = selected;
+            core.dir_picker_buffer = typed.into();
+            core.dispatch_action(Action::DirPickerSubmit);
 
-        // Navigation keeps the browser open and re-targets the browse dir.
-        assert_eq!(core.mode, Mode::DirectoryPicker);
-        assert_eq!(core.dir_browser_cwd, "/home/user/dev");
-        match rx.try_recv().expect("a new listing was requested") {
-            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/home/user/dev"),
-            other => panic!("expected ListDirectory, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn submit_up_navigates_to_parent() {
-        let (mut core, mut rx) = connected_core();
-        core.open_directory_browser();
-        deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
-        while rx.try_recv().is_ok() {}
-
-        core.dir_picker_selected = 1; // the Up row
-        core.dispatch_action(Action::DirPickerSubmit);
-
-        assert_eq!(core.mode, Mode::DirectoryPicker);
-        assert_eq!(core.dir_browser_cwd, "/home");
-        match rx.try_recv().expect("a parent listing was requested") {
-            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/home"),
-            other => panic!("expected ListDirectory, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn submit_typed_absolute_path_navigates_when_unmatched() {
-        let (mut core, mut rx) = connected_core();
-        core.open_directory_browser();
-        deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
-        while rx.try_recv().is_ok() {}
-
-        // Type an absolute path that matches no listed subdir, then submit while
-        // CreateHere (row 0) is selected: the browser navigates to the typed path.
-        core.dir_picker_selected = 0;
-        core.dir_picker_buffer = "/var/log".into();
-        core.dispatch_action(Action::DirPickerSubmit);
-
-        assert_eq!(core.mode, Mode::DirectoryPicker);
-        assert_eq!(core.dir_browser_cwd, "/var/log");
-        match rx
-            .try_recv()
-            .expect("a listing for the typed path was requested")
-        {
-            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/var/log"),
-            other => panic!("expected ListDirectory, got {other:?}"),
+            assert_eq!(core.mode, Mode::DirectoryPicker, "{label}");
+            assert_eq!(core.dir_browser_cwd, expected, "{label}");
+            assert_eq!(expect_list_directory(&mut rx), expected, "{label}");
         }
     }
 
@@ -1733,18 +1638,16 @@ mod tests {
         core.initial_cwd = "/fallback".into();
         core.mgr
             .session_list
-            .push(entry("eagle", "/home/user/proj"));
+            .push(sample_session_entry("eagle", "/home/user/proj"));
         core.mgr.select_session("eagle".into());
         while rx.try_recv().is_ok() {}
 
         core.dispatch_action(Action::CreateSession);
 
-        match rx.try_recv().expect("a session create was sent") {
-            ClientMessage::SessionCreate { cwd, .. } => {
-                assert_eq!(cwd.as_deref(), Some("/home/user/proj"));
-            }
-            other => panic!("expected SessionCreate, got {other:?}"),
-        }
+        assert_eq!(
+            expect_session_create(&mut rx).as_deref(),
+            Some("/home/user/proj")
+        );
     }
 
     #[test]
@@ -1757,12 +1660,7 @@ mod tests {
         // than letting the daemon resolve a bare path against its own cwd.
         core.dispatch_action(Action::CreateSession);
 
-        match rx.try_recv().expect("a session create was sent") {
-            ClientMessage::SessionCreate { cwd, .. } => {
-                assert_eq!(cwd.as_deref(), Some("/fallback"));
-            }
-            other => panic!("expected SessionCreate, got {other:?}"),
-        }
+        assert_eq!(expect_session_create(&mut rx).as_deref(), Some("/fallback"));
     }
 
     #[test]
@@ -1771,7 +1669,7 @@ mod tests {
         core.initial_cwd = "/fallback".into();
         core.mgr
             .session_list
-            .push(entry("eagle", "/home/user/proj"));
+            .push(sample_session_entry("eagle", "/home/user/proj"));
         core.peer_targets.insert(
             "alice@box".into(),
             PeerTarget::Ssh {

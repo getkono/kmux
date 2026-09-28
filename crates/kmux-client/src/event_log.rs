@@ -130,12 +130,6 @@ impl EventLog {
         let skip = self.entries.len().saturating_sub(n);
         self.entries.iter().skip(skip)
     }
-
-    #[cfg(test)]
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 impl Default for EventLog {
@@ -165,123 +159,124 @@ impl DiagSnapshot {
 mod tests {
     use super::*;
 
-    #[test]
-    fn diag_event_display() {
-        let ev = DiagEvent::StaleDiscard {
-            session: "main".into(),
-        };
-        assert_eq!(ev.to_string(), "Stale discard on 'main'");
-
-        let ev = DiagEvent::SeqnoGap {
-            session: "main".into(),
-            expected: 42,
-            got: 44,
-        };
-        assert_eq!(ev.to_string(), "Seqno gap: 42\u{2192}44 on 'main'");
-
-        let ev = DiagEvent::Lagged {
-            session: "main".into(),
-            missed: 5,
-        };
-        assert_eq!(ev.to_string(), "Lagged on 'main': missed 5");
-
-        let ev = DiagEvent::Resync {
-            session: "main".into(),
-            reason: "seqno gap".into(),
-        };
-        assert_eq!(ev.to_string(), "Resync 'main': seqno gap");
+    fn resync(session: &str) -> DiagEvent {
+        DiagEvent::Resync {
+            session: session.into(),
+            reason: "test".into(),
+        }
     }
 
-    #[test]
-    fn counters_increment() {
-        let mut c = DiagCounters::default();
-        c.increment(&DiagEvent::StaleDiscard {
-            session: "a".into(),
-        });
-        c.increment(&DiagEvent::StaleDiscard {
-            session: "b".into(),
-        });
-        c.increment(&DiagEvent::SeqnoGap {
-            session: "a".into(),
-            expected: 1,
-            got: 3,
-        });
-        c.increment(&DiagEvent::Lagged {
-            session: "a".into(),
-            missed: 2,
-        });
-        c.increment(&DiagEvent::Resync {
-            session: "a".into(),
-            reason: "lag".into(),
-        });
-        assert_eq!(c.stale_discards, 2);
-        assert_eq!(c.seqno_gaps, 1);
-        assert_eq!(c.lag_events, 1);
-        assert_eq!(c.resyncs, 1);
-    }
-
-    #[test]
-    fn event_log_push_and_recent() {
-        let mut log = EventLog::new();
-        log.push(DiagEvent::Resync {
-            session: "a".into(),
-            reason: "test".into(),
-        });
-        log.push(DiagEvent::Resync {
-            session: "b".into(),
-            reason: "test".into(),
-        });
-        log.push(DiagEvent::Resync {
-            session: "c".into(),
-            reason: "test".into(),
-        });
-
-        let recent: Vec<_> = log.recent(2).collect();
-        assert_eq!(recent.len(), 2);
-        assert!(matches!(&recent[0].1, DiagEvent::Resync { .. }));
-        assert!(matches!(&recent[1].1, DiagEvent::Resync { .. }));
-    }
-
-    #[test]
-    fn event_log_eviction() {
+    fn log_of(capacity: usize, sessions: &[&str]) -> EventLog {
         let mut log = EventLog {
-            entries: VecDeque::with_capacity(3),
-            capacity: 3,
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
         };
-        log.push(DiagEvent::Resync {
-            session: "a".into(),
-            reason: "1".into(),
-        });
-        log.push(DiagEvent::Resync {
-            session: "b".into(),
-            reason: "2".into(),
-        });
-        log.push(DiagEvent::Resync {
-            session: "c".into(),
-            reason: "3".into(),
-        });
-        log.push(DiagEvent::Resync {
-            session: "d".into(),
-            reason: "4".into(),
-        }); // evicts first
-        assert_eq!(log.len(), 3);
-        let first = log.recent(3).next().unwrap();
-        assert!(matches!(&first.1, DiagEvent::Resync { .. }));
+        for s in sessions {
+            log.push(resync(s));
+        }
+        log
+    }
+
+    /// The session of each of the last `n` events, oldest first.
+    fn recent_sessions(log: &EventLog, n: usize) -> Vec<String> {
+        log.recent(n)
+            .map(|(_, ev)| match ev {
+                DiagEvent::Resync { session, .. } => session.clone(),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect()
+    }
+
+    fn every_variant() -> [DiagEvent; 6] {
+        let session = || "main".to_string();
+        [
+            DiagEvent::StaleDiscard { session: session() },
+            DiagEvent::SeqnoGap {
+                session: session(),
+                expected: 42,
+                got: 44,
+            },
+            DiagEvent::Lagged {
+                session: session(),
+                missed: 5,
+            },
+            DiagEvent::Resync {
+                session: session(),
+                reason: "seqno gap".into(),
+            },
+            DiagEvent::Tear {
+                session: session(),
+                prev_sent_at_ms: 1000,
+                next_sent_at_ms: 1008,
+            },
+            DiagEvent::DigestMismatch {
+                session: session(),
+                seqno: 7,
+            },
+        ]
     }
 
     #[test]
-    fn diag_snapshot_from_log() {
+    fn diag_event_display_every_variant_formats_its_fields() {
+        let want = [
+            "Stale discard on 'main'",
+            "Seqno gap: 42\u{2192}44 on 'main'",
+            "Lagged on 'main': missed 5",
+            "Resync 'main': seqno gap",
+            "Tear on 'main': 1000\u{2192}1008ms",
+            "Grid digest mismatch on 'main' at seqno 7",
+        ];
+        for (ev, want) in every_variant().iter().zip(want) {
+            assert_eq!(ev.to_string(), want, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn diag_counters_increment_each_variant_bumps_only_its_counter() {
+        let mut c = DiagCounters::default();
+        for (i, ev) in every_variant().iter().enumerate() {
+            // Variant i is recorded i + 1 times so a crossed wire shows.
+            for _ in 0..=i {
+                c.increment(ev);
+            }
+        }
+        assert_eq!(
+            [
+                c.stale_discards,
+                c.seqno_gaps,
+                c.lag_events,
+                c.resyncs,
+                c.tears,
+                c.digest_mismatches
+            ],
+            [1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn event_log_recent_returns_the_last_n_oldest_first() {
+        let log = log_of(EVENT_LOG_CAPACITY, &["a", "b", "c"]);
+        assert_eq!(recent_sessions(&log, 2), ["b", "c"]);
+        assert_eq!(recent_sessions(&log, 10), ["a", "b", "c"], "n past len");
+    }
+
+    #[test]
+    fn event_log_push_at_capacity_evicts_the_oldest() {
+        let log = log_of(3, &["a", "b", "c", "d"]);
+        assert_eq!(recent_sessions(&log, usize::MAX), ["b", "c", "d"]);
+    }
+
+    #[test]
+    fn diag_snapshot_from_log_formats_the_most_recent_events() {
         let mut log = EventLog::new();
         log.push(DiagEvent::StaleDiscard {
             session: "main".into(),
         });
-        log.push(DiagEvent::Resync {
-            session: "main".into(),
-            reason: "test".into(),
-        });
+        log.push(resync("main"));
+        log.push(resync("other"));
 
-        let snap = DiagSnapshot::from_log(&log, 5);
-        assert_eq!(snap.events.len(), 2);
-        assert_eq!(snap.events[1].1, "Resync 'main': test");
+        let snap = DiagSnapshot::from_log(&log, 2);
+        let texts: Vec<&str> = snap.events.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(texts, ["Resync 'main': test", "Resync 'other': test"]);
     }
 }

@@ -137,57 +137,45 @@ pub(super) async fn on_pane_split(
 mod tests {
     use super::super::testing::*;
 
+    /// A create or split in an unknown session names the session; a close
+    /// of a pane in an unknown session names the pane.
     #[tokio::test]
-    async fn pane_create_for_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::PaneCreate {
-            request_id: 3,
-            word_id: MISSING_WORD.to_string(),
-            program: None,
-            args: vec![],
-            size: TermSize::default(),
-        })
+    async fn pane_ops_on_an_unknown_target_error_with_the_request_id() {
+        assert_all_rejected(vec![
+            session_not_found(
+                "PaneCreate",
+                Some(3),
+                ClientMessage::PaneCreate {
+                    request_id: 3,
+                    word_id: MISSING_WORD.to_string(),
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+            ),
+            pane_not_found(
+                "PaneClose",
+                Some(4),
+                ClientMessage::PaneClose {
+                    request_id: 4,
+                    pane_id: MISSING_PANE.to_string(),
+                },
+            ),
+            session_not_found(
+                "PaneSplit",
+                Some(8),
+                ClientMessage::PaneSplit {
+                    request_id: 8,
+                    word_id: MISSING_WORD.to_string(),
+                    tab_index: 0,
+                    from_pane: 0,
+                    dir: SplitDir::Horizontal,
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+            ),
+        ])
         .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(3));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn pane_close_of_an_unknown_pane_errors_naming_the_pane_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::PaneClose {
-            request_id: 4,
-            pane_id: MISSING_PANE.to_string(),
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(4));
-        // Every pane-scoped arm below reports `PaneNotFound`; the three ways a
-        // lookup can miss (unparseable id, unknown session, unknown index) are
-        // deliberately indistinguishable to the client.
-        assert_eq!(code, ErrorCode::PaneNotFound);
-        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
-    }
-
-    #[tokio::test]
-    async fn pane_split_in_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::PaneSplit {
-            request_id: 8,
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            from_pane: 0,
-            dir: SplitDir::Horizontal,
-            program: None,
-            args: vec![],
-            size: TermSize::default(),
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(8));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 }

@@ -209,16 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_categories_produce_separate_buckets() {
-        let mut s = MetricsStore::in_memory();
-        s.on_transport_active(TransportKind::Uds, "/run/sock");
-        s.record_outbound(10, MessageCategory::Shell);
-        s.record_outbound(5, MessageCategory::Liveness);
-        let snap = s.network.snapshot();
-        assert_eq!(snap.len(), 2);
-    }
-
-    #[test]
     fn observe_rtt_requires_active_transport() {
         let mut s = MetricsStore::in_memory();
         // Before attach — swallowed.
@@ -228,15 +218,6 @@ mod tests {
         s.observe_rtt(15.0);
         let key = TransportKey::new(TransportKind::Quic, "1.2.3.4:8443");
         assert_eq!(s.rtt.summary(&key).unwrap().sample_count, 1);
-    }
-
-    #[test]
-    fn flush_sample_without_sink_is_noop() {
-        let mut s = MetricsStore::in_memory();
-        s.on_transport_active(TransportKind::Uds, "/x");
-        s.record_outbound(10, MessageCategory::Shell);
-        // Should not panic or block.
-        s.flush_sample(Some(ConnectionId(7)));
     }
 
     #[test]

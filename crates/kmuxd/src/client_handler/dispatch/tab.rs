@@ -113,70 +113,56 @@ pub(super) async fn on_tab_reorder(
 mod tests {
     use super::super::testing::*;
 
+    /// An unknown session is `SessionNotFound`, correlated whenever the
+    /// message carries a request id.
     #[tokio::test]
-    async fn tab_create_for_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::TabCreate {
-            request_id: 5,
-            word_id: MISSING_WORD.to_string(),
-            program: None,
-            args: vec![],
-            size: TermSize::default(),
-        })
+    async fn tab_ops_in_an_unknown_session_error_naming_the_word_id() {
+        let word_id = || MISSING_WORD.to_string();
+        assert_all_rejected(vec![
+            session_not_found(
+                "TabCreate",
+                Some(5),
+                ClientMessage::TabCreate {
+                    request_id: 5,
+                    word_id: word_id(),
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+            ),
+            // A `TabClosed` reply also suppresses the session-event broadcast
+            // that follows it, so the old answer was a success the rest of the
+            // fleet never heard about.
+            session_not_found(
+                "TabClose",
+                Some(6),
+                ClientMessage::TabClose {
+                    request_id: 6,
+                    word_id: word_id(),
+                    tab_index: 0,
+                },
+            ),
+            session_not_found(
+                "TabRename",
+                Some(7),
+                ClientMessage::TabRename {
+                    request_id: 7,
+                    word_id: word_id(),
+                    tab_index: 0,
+                    new_name: "renamed".to_string(),
+                },
+            ),
+            // `TabReorder` carries no request id, so the error cannot correlate.
+            session_not_found(
+                "TabReorder",
+                None,
+                ClientMessage::TabReorder {
+                    word_id: word_id(),
+                    tab_index: 0,
+                    new_position: 1,
+                },
+            ),
+        ])
         .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(5));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn tab_close_of_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::TabClose {
-            request_id: 6,
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-        })
-        .await;
-        assert!(keep);
-        // A `TabClosed` reply also suppresses the session-event broadcast that
-        // follows it, so the old answer was a success the rest of the fleet
-        // never heard about.
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(6));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn tab_rename_for_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::TabRename {
-            request_id: 7,
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            new_name: "renamed".to_string(),
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(7));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn tab_reorder_for_an_unknown_session_errors_without_a_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::TabReorder {
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            new_position: 1,
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        // `TabReorder` carries no request id, so the error cannot correlate.
-        assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 }

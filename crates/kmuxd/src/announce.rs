@@ -176,52 +176,40 @@ mod tests {
 
     // ── audience_filtering_local_ssh_public ───────────────────────────────────
 
+    /// Which bootstrap paths see a listener, by its audience.
     #[test]
-    fn audience_any_visible_to_all_paths() {
-        let l = quic_listener(Audience::Any);
-        assert!(advert_for(&l, BootstrapPath::Uds, None).is_some());
-        assert!(advert_for(&l, BootstrapPath::Ssh, None).is_some());
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 0);
-        assert!(advert_for(&l, BootstrapPath::Network { peer }, None).is_some());
-    }
-
-    #[test]
-    fn audience_local_visible_only_to_uds_and_loopback() {
-        let l = uds_listener(Audience::Local);
-        assert!(advert_for(&l, BootstrapPath::Uds, None).is_some());
-
-        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        assert!(advert_for(&l, BootstrapPath::Network { peer: loopback }, None).is_some());
-
-        let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 0);
-        assert!(advert_for(&l, BootstrapPath::Network { peer: public }, None).is_none());
-        assert!(advert_for(&l, BootstrapPath::Ssh, None).is_none());
-    }
-
-    #[test]
-    fn audience_ssh_only_visible_only_via_ssh() {
-        let l = tcp_listener(Audience::SshOnly);
-        assert!(advert_for(&l, BootstrapPath::Ssh, None).is_some());
-        assert!(advert_for(&l, BootstrapPath::Uds, None).is_none());
-        let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 0);
-        assert!(advert_for(&l, BootstrapPath::Network { peer: public }, None).is_none());
-    }
-
-    #[test]
-    fn audience_lan_visible_to_rfc1918() {
-        let l = quic_listener(Audience::Lan);
-        let lan = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 0);
-        assert!(advert_for(&l, BootstrapPath::Network { peer: lan }, None).is_some());
-
-        let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 0);
-        assert!(advert_for(&l, BootstrapPath::Network { peer: public }, None).is_none());
-    }
-
-    #[test]
-    fn disabled_listener_not_announced() {
-        let mut l = quic_listener(Audience::Any);
-        l.enabled = false;
-        assert!(advert_for(&l, BootstrapPath::Uds, None).is_none());
+    fn a_listener_is_announced_only_to_its_audience() {
+        let net = |a, b, c, d| BootstrapPath::Network {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 0),
+        };
+        let (uds, ssh, public) = (BootstrapPath::Uds, BootstrapPath::Ssh, net(8, 8, 8, 8));
+        let any = quic_listener(Audience::Any);
+        let local = uds_listener(Audience::Local);
+        let ssh_only = tcp_listener(Audience::SshOnly);
+        let lan = quic_listener(Audience::Lan);
+        let disabled = ListenConfig {
+            enabled: false,
+            ..quic_listener(Audience::Any)
+        };
+        let cases = [
+            ("any via UDS", &any, uds, true),
+            ("any via SSH", &any, ssh, true),
+            ("any via public", &any, public, true),
+            ("local via UDS", &local, uds, true),
+            ("local via loopback", &local, net(127, 0, 0, 1), true),
+            ("local via public", &local, public, false),
+            ("local via SSH", &local, ssh, false),
+            ("ssh-only via SSH", &ssh_only, ssh, true),
+            ("ssh-only via UDS", &ssh_only, uds, false),
+            ("ssh-only via public", &ssh_only, net(1, 2, 3, 4), false),
+            ("lan via RFC 1918", &lan, net(192, 168, 1, 1), true),
+            ("lan via public", &lan, public, false),
+            ("disabled via UDS", &disabled, uds, false),
+        ];
+        for (label, listener, path, visible) in cases {
+            let announced = advert_for(listener, path, None).is_some();
+            assert_eq!(announced, visible, "{label}");
+        }
     }
 
     #[test]
@@ -255,25 +243,17 @@ mod tests {
     // ── is_lan_address ────────────────────────────────────────────────────────
 
     #[test]
-    fn rfc1918_is_lan() {
-        for ip in [
-            "10.0.0.1",
-            "10.255.255.255",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.168.0.1",
+    fn is_lan_address_holds_for_rfc1918_only() {
+        for (ip, lan) in [
+            ("10.0.0.1", true),
+            ("10.255.255.255", true),
+            ("172.16.0.1", true),
+            ("172.31.255.255", true),
+            ("192.168.0.1", true),
+            ("8.8.8.8", false),
         ] {
             let addr: IpAddr = ip.parse().unwrap();
-            assert!(
-                is_lan_address(SocketAddr::new(addr, 0)),
-                "{ip} should be LAN"
-            );
+            assert_eq!(is_lan_address(SocketAddr::new(addr, 0)), lan, "{ip}");
         }
-    }
-
-    #[test]
-    fn public_ip_is_not_lan() {
-        let addr: IpAddr = "8.8.8.8".parse().unwrap();
-        assert!(!is_lan_address(SocketAddr::new(addr, 0)));
     }
 }

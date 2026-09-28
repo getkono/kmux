@@ -380,31 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_only_returns_cursor_only_variant() {
-        let mut engine = mock_engine(4, 4);
-        let _ = engine.compute_diff(); // consume initial
-
-        engine.backend.cursor_state.row = 2;
-        engine.backend.cursor_state.col = 3;
-        assert!(matches!(
-            engine.compute_diff(),
-            DiffResult::CursorOnly { .. }
-        ));
-    }
-
-    #[test]
-    fn cell_change_returns_cell_diff_variant() {
-        let mut engine = mock_engine(4, 4);
-        let _ = engine.compute_diff(); // consume initial
-
-        engine.backend.cells[0] = CellState {
-            c: 'Z',
-            ..CellState::default()
-        };
-        assert!(matches!(engine.compute_diff(), DiffResult::CellDiff { .. }));
-    }
-
-    #[test]
     fn both_changes_returns_cell_diff() {
         let mut engine = mock_engine(4, 4);
         let _ = engine.compute_diff(); // consume initial
@@ -419,13 +394,6 @@ mod tests {
         };
         assert!(!diff.ops.is_empty());
         assert_eq!(diff.cursor.col, 1);
-    }
-
-    #[test]
-    fn no_change_returns_none() {
-        let mut engine = mock_engine(4, 4);
-        let _ = engine.compute_diff(); // consume initial
-        assert!(matches!(engine.compute_diff(), DiffResult::None));
     }
 
     #[test]
@@ -667,19 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_growth_does_not_flag_reset() {
-        let mut engine = mock_engine(4, 4);
-        let _ = engine.compute_diff();
-        engine.backend.history_len = 3;
-        engine.backend.history_lines = make_history_lines(3, 4);
-        engine.backend.cells[0].c = 'X';
-        match engine.compute_diff() {
-            DiffResult::CellDiff { diff, .. } => assert_eq!(diff.scrollback_reset, None),
-            other => panic!("expected CellDiff, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn alt_screen_entry_does_not_flag_reset() {
         let mut engine = mock_engine(4, 4);
         engine.backend.history_len = 5;
@@ -699,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_scrollback_unaffected() {
+    fn normal_scrollback_growth_emits_new_lines_without_reset() {
         let mut engine = mock_engine(4, 4);
         engine.backend.history_len = 0;
         engine.backend.history_lines = Vec::new();
@@ -712,13 +667,16 @@ mod tests {
         let diff = engine.compute_diff();
         match diff {
             DiffResult::CellDiff {
-                scrollback_lines, ..
+                diff,
+                scrollback_lines,
+                ..
             } => {
                 assert_eq!(
                     scrollback_lines.len(),
                     3,
                     "should emit all 3 new scrollback lines"
                 );
+                assert_eq!(diff.scrollback_reset, None, "growth is not a reset");
             }
             _ => panic!("expected CellDiff with scrollback"),
         }

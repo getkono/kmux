@@ -12,6 +12,12 @@
 # hand-written policy and is carried through verbatim, apart from the toolchain
 # stamp.
 #
+# The [[mutants]] rows are the exception to "tightened by `mise run baseline`":
+# they come from a full weekly mutation sweep, proposed by
+# `mise run mutants-gate --write` over its merged outcomes and committed by
+# hand; `mise run baseline` carries them through unchanged. See
+# docs/testing.md R12.
+#
 # Deliberately NOT ratcheted: clippy::str_to_string, 715 sites. It fires on
 # `.to_string()` for a &str, which is idiomatic and reads better than the
 # `.to_owned()` it asks for; a 715-row budget would be noise standing in front
@@ -129,7 +135,7 @@ count = 5
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::needless_pass_by_value"
-count = 6
+count = 5
 
 [[lints]]
 crate = "kmux-app"
@@ -239,7 +245,7 @@ count = 17
 [[lints]]
 crate = "kmux-client"
 lint = "missing_docs"
-count = 307
+count = 306
 
 [[lints]]
 crate = "kmux-connect"
@@ -804,7 +810,7 @@ count = 2
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::too_many_lines"
-count = 7
+count = 6
 
 [[lints]]
 crate = "kmuxd"
@@ -842,7 +848,7 @@ count = 3
 
 [[allows]]
 crate = "kmux-client"
-count = 9
+count = 8
 
 [[allows]]
 crate = "kmux-connect"
@@ -875,3 +881,59 @@ count = 1
 [[allows]]
 crate = "kmuxd"
 count = 7
+
+[[mutants]]
+crate = "kmux"
+missed = 27
+
+[[mutants]]
+crate = "kmux-app"
+missed = 669
+
+[[mutants]]
+crate = "kmux-client"
+missed = 263
+
+[[mutants]]
+crate = "kmux-connect"
+missed = 148
+
+[[mutants]]
+crate = "kmux-ffi"
+missed = 176
+
+[[mutants]]
+crate = "kmux-ghostty"
+missed = 35
+
+[[mutants]]
+crate = "kmux-gtk"
+missed = 727
+
+[[mutants]]
+crate = "kmux-protocol"
+missed = 37
+
+[[mutants]]
+crate = "kmux-pty"
+missed = 63
+
+[[mutants]]
+crate = "kmux-render"
+missed = 320
+
+[[mutants]]
+crate = "kmux-sys"
+missed = 27
+
+[[mutants]]
+crate = "kmux-vt-core"
+missed = 61
+
+[[mutants]]
+crate = "kmux-vt-worker"
+missed = 8
+
+[[mutants]]
+crate = "kmuxd"
+missed = 320

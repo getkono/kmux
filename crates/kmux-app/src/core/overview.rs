@@ -208,10 +208,9 @@ fn push_process_rows(rows: &mut Vec<OverviewRow>, pp: &PaneProcesses) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_client::session_manager::SessionManager;
     use kmux_protocol::messages::{
-        ClientCapabilities, LayoutNode, PaneInfo, PaneProcesses, ProcessSample, SessionEntry,
-        SessionMeta, SessionStatus, TabInfo, TermSize,
+        LayoutNode, PaneInfo, PaneProcesses, ProcessSample, SessionEntry, SessionMeta,
+        SessionStatus, TabInfo, TermSize,
     };
 
     fn pane(word: &str, idx: u32) -> PaneInfo {
@@ -252,18 +251,10 @@ mod tests {
     }
 
     fn core_with(entries: Vec<SessionEntry>, snapshot: Vec<PaneProcesses>) -> AppCore {
-        let mut mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            8443,
-            "tok".into(),
-            true,
-            ClientCapabilities::default(),
-        );
-        for e in entries {
-            mgr.session_list.push(e);
-        }
-        mgr.process_overview = snapshot;
-        AppCore::for_test(mgr)
+        let mut core = crate::fixtures::fixture_core();
+        core.mgr.session_list = entries;
+        core.mgr.process_overview = snapshot;
+        core
     }
 
     #[test]

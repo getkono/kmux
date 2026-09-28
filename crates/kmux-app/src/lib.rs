@@ -77,3 +77,6 @@ pub mod core;
 /// The toolkit-agnostic run-loop driver ([`driver::FrontendDriver`]) that owns
 /// the network channels + pump shared by every frontend.
 pub mod driver;
+
+#[cfg(test)]
+mod fixtures;

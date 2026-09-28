@@ -1289,107 +1289,43 @@ mod tests {
         assert_eq!(Key::CapsLock as u16, 83);
     }
 
-    fn enc_default() -> KeyEncodeOptions {
-        KeyEncodeOptions::default()
-    }
-
-    fn enc_kitty() -> KeyEncodeOptions {
-        KeyEncodeOptions {
-            kitty_flags: sys::KITTY_KBD_DISAMBIGUATE,
-            ..Default::default()
+    #[test]
+    fn encode_key_emits_the_expected_bytes() {
+        let none = KeyMods::empty();
+        // (kitty disambiguate negotiated, key, mods) -> bytes
+        let cases: [(bool, Option<Key>, KeyMods, &[u8]); 7] = [
+            (false, Some(Key::Enter), none, b"\r"),
+            (false, Some(Key::Tab), none, b"\t"),
+            // Shift+Tab is xterm CBT, regardless of kitty flags.
+            (false, Some(Key::Tab), KeyMods::SHIFT, b"\x1b[Z"),
+            // CSI 13;2u is what Claude Code expects after `\x1b[>1u`.
+            (true, Some(Key::Enter), KeyMods::SHIFT, b"\x1b[13;2u"),
+            (true, Some(Key::Enter), KeyMods::ALT, b"\x1b[13;3u"),
+            // xterm legacy modified cursor key.
+            (false, Some(Key::ArrowUp), KeyMods::CTRL, b"\x1b[1;5A"),
+            // No key and no text encodes nothing.
+            (false, None, none, b""),
+        ];
+        for (kitty, key, mods, expected) in cases {
+            let opts = KeyEncodeOptions {
+                kitty_flags: if kitty {
+                    sys::KITTY_KBD_DISAMBIGUATE
+                } else {
+                    0
+                },
+                ..Default::default()
+            };
+            let event = KeyEvent {
+                key,
+                mods,
+                ..Default::default()
+            };
+            assert_eq!(
+                encode_key(&opts, &event).unwrap(),
+                expected,
+                "kitty={kitty} {key:?} {mods:?}"
+            );
         }
-    }
-
-    #[test]
-    fn encode_plain_enter_is_cr() {
-        let bytes = encode_key(
-            &enc_default(),
-            &KeyEvent {
-                key: Some(Key::Enter),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, b"\r");
-    }
-
-    #[test]
-    fn encode_plain_tab_is_tab() {
-        let bytes = encode_key(
-            &enc_default(),
-            &KeyEvent {
-                key: Some(Key::Tab),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, b"\t");
-    }
-
-    #[test]
-    fn encode_shift_tab_is_csi_z() {
-        // Shift+Tab → xterm CBT, regardless of kitty flags.
-        let bytes = encode_key(
-            &enc_default(),
-            &KeyEvent {
-                key: Some(Key::Tab),
-                mods: KeyMods::SHIFT,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, b"\x1b[Z");
-    }
-
-    #[test]
-    fn encode_shift_enter_with_kitty_is_csi_u() {
-        // Shift+Enter with kitty disambiguate → CSI 13;2u.
-        // This is what Claude Code expects after `\x1b[>1u` negotiation.
-        let bytes = encode_key(
-            &enc_kitty(),
-            &KeyEvent {
-                key: Some(Key::Enter),
-                mods: KeyMods::SHIFT,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, b"\x1b[13;2u");
-    }
-
-    #[test]
-    fn encode_alt_enter_with_kitty_is_csi_u_mod3() {
-        let bytes = encode_key(
-            &enc_kitty(),
-            &KeyEvent {
-                key: Some(Key::Enter),
-                mods: KeyMods::ALT,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, b"\x1b[13;3u");
-    }
-
-    #[test]
-    fn encode_ctrl_arrow_up_modifies_csi_a() {
-        // Ctrl+Up → ESC[1;5A in xterm legacy.
-        let bytes = encode_key(
-            &enc_default(),
-            &KeyEvent {
-                key: Some(Key::ArrowUp),
-                mods: KeyMods::CTRL,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(bytes, b"\x1b[1;5A");
-    }
-
-    #[test]
-    fn encode_unidentified_with_no_text_is_empty() {
-        let bytes = encode_key(&enc_default(), &KeyEvent::default()).unwrap();
-        assert!(bytes.is_empty());
     }
 
     #[test]

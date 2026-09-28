@@ -56,21 +56,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn process_sample_roundtrips() {
-        let sample = ProcessSample {
-            pid: 4242,
-            ppid: Some(1),
-            name: "vim".into(),
-            cmd: "vim src/main.rs".into(),
-            cpu_percent: 12.5,
-            mem_bytes: 34_000_000,
-        };
-        let bytes = rmp_serde::to_vec_named(&sample).expect("serialize");
-        let decoded: ProcessSample = rmp_serde::from_slice(&bytes).expect("deserialize");
-        assert_eq!(decoded, sample);
-    }
-
-    #[test]
     fn pane_processes_roundtrips() {
         let pane = PaneProcesses {
             pane_id: "eagle/0".into(),

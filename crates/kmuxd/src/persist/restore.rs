@@ -295,27 +295,6 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn empty_v2_state() -> PersistedDaemonState {
-        PersistedDaemonState {
-            version: STATE_VERSION,
-            session_index_counter: 5,
-            used_words: vec!["eagle".to_string()],
-            sessions: vec![],
-        }
-    }
-
-    #[test]
-    fn read_valid_checkpoint() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("state.bin");
-
-        write_state(&empty_v2_state(), &path);
-
-        let loaded = read_checkpoint(&path).unwrap();
-        assert_eq!(loaded.session_index_counter, 5);
-        assert_eq!(loaded.used_words, vec!["eagle"]);
-    }
-
     #[test]
     fn reject_newer_version() {
         let tmp = tempfile::tempdir().unwrap();
