@@ -36,7 +36,6 @@ mod wordlist;
 // `crate::diff_engine::…` / `crate::term_state::…` paths keep resolving.
 pub use kmux_vt_core::{backend, diff_engine, term_state};
 
-use anyhow::Context as _;
 use clap::Parser;
 use rand::Rng;
 use tracing::Instrument;
@@ -214,7 +213,7 @@ fn main() -> anyhow::Result<()> {
 
     // What a graceful-restart successor is started with, built here where
     // this daemon resolves its paths: from the flags it was started with.
-    let successor_args = successor_args(&cli)?;
+    let successor_args = successor_args(&cli);
 
     // Load the config before logging starts: it says how the log rotates.
     let (mut cfg_file, cfg_source) = config::load_config(cli.config.as_deref())?;
@@ -638,20 +637,22 @@ pub(crate) fn boot_log_stdio() -> (std::process::Stdio, std::process::Stdio) {
 /// loopback came back from a restart bound to every interface.
 ///
 /// Paths are made absolute against this process's working directory, where
-/// this daemon resolves them; the successor starts in `/`.
-fn successor_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
+/// this daemon resolves them; the successor starts in `/`. One that cannot be
+/// (an empty path) is passed as given, to fail in the successor as it would
+/// have here: building these never stops this daemon from starting.
+fn successor_args(cli: &Cli) -> Vec<std::ffi::OsString> {
     use clap::ValueEnum as _;
     use std::ffi::OsString;
 
-    let absolute = |path: &std::path::Path| -> anyhow::Result<OsString> {
-        Ok(std::path::absolute(path)
-            .with_context(|| format!("resolving {}", path.display()))?
-            .into_os_string())
+    let absolute = |path: &std::path::Path| -> OsString {
+        std::path::absolute(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .into_os_string()
     };
     let mut args: Vec<OsString> = vec!["--daemon".into(), "--handoff".into()];
     let mut flag = |name: &str, value: OsString| args.extend([name.into(), value]);
     if let Some(config) = &cli.config {
-        flag("--config", absolute(config)?);
+        flag("--config", absolute(config));
     }
     if let Some(bind) = &cli.bind {
         flag("--bind", bind.into());
@@ -663,17 +664,17 @@ fn successor_args(cli: &Cli) -> anyhow::Result<Vec<std::ffi::OsString>> {
         flag("--tcp-port", port.to_string().into());
     }
     if let Some(cert) = &cli.cert {
-        flag("--cert", absolute(cert.as_ref())?);
+        flag("--cert", absolute(cert.as_ref()));
     }
     if let Some(key) = &cli.key {
-        flag("--key", absolute(key.as_ref())?);
+        flag("--key", absolute(key.as_ref()));
     }
     if let Some(mode) = cli.session_isolation
         && let Some(value) = mode.to_possible_value()
     {
         flag("--session-isolation", value.get_name().into());
     }
-    Ok(args)
+    args
 }
 
 fn generate_instance_id() -> String {
@@ -718,8 +719,9 @@ mod tests {
         ])
         .unwrap();
 
-        let args = successor_args(&cli).unwrap();
-        let successor = Cli::try_parse_from(std::iter::once("kmuxd".into()).chain(args)).unwrap();
+        let args = successor_args(&cli);
+        let successor =
+            Cli::try_parse_from(std::iter::once("kmuxd".into()).chain(args.clone())).unwrap();
 
         let cwd = std::env::current_dir().unwrap();
         assert!(successor.daemon && successor.handoff);
@@ -738,7 +740,9 @@ mod tests {
         );
 
         let bare = Cli::try_parse_from(["kmuxd", "--daemon"]).unwrap();
-        assert_eq!(successor_args(&bare).unwrap(), ["--daemon", "--handoff"]);
+        assert_eq!(successor_args(&bare), ["--daemon", "--handoff"]);
+        // A successor's own successor is started the same way.
+        assert_eq!(successor_args(&successor), args);
     }
 
     /// `probe-or-start` hands back the daemon's SSH view as it is, and builds

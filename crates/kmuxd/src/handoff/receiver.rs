@@ -180,10 +180,14 @@ pub(crate) async fn exits_within(alive: &impl Fn() -> bool, grace: Duration) -> 
 /// any of `listeners` binds a fixed port, before this daemon binds them
 /// (issue #234). The predecessor lets go of its listeners only as it exits,
 /// after `Released`, and a fixed port can be bound by one process at a time;
-/// an ephemeral one cannot collide, so with none nothing waits. `Err` when
-/// the predecessor outlives the grace period: binding may then fail.
+/// an ephemeral one cannot collide, so with none nothing waits.
+///
+/// A predecessor that outlives `grace` still holds its ports, and a bind that
+/// failed would end this daemon with the inherited shells in its hands. So
+/// the fixed ports become ephemeral instead — the bind address is kept, so
+/// nothing is exposed that was not — and `Err` says so, for the log.
 pub(crate) async fn await_fixed_ports(
-    listeners: &[ListenConfig],
+    listeners: &mut [ListenConfig],
     alive: impl Fn() -> bool,
     grace: Duration,
 ) -> anyhow::Result<()> {
@@ -191,10 +195,12 @@ pub(crate) async fn await_fixed_ports(
         return Ok(());
     }
     if exits_within(&alive, grace).await {
-        Ok(())
-    } else {
-        bail!("the predecessor still runs after {grace:?}; its fixed ports may not bind")
+        return Ok(());
     }
+    for listener in listeners.iter_mut().filter(|l| l.has_fixed_port()) {
+        listener.port = 0;
+    }
+    bail!("the predecessor still runs after {grace:?}; its fixed ports are ephemeral instead")
 }
 
 /// The protocol exchange proper. `Err` says where it stood when it failed.
@@ -679,7 +685,8 @@ mod tests {
     }
 
     /// A successor with a fixed port waits for its predecessor to exit before
-    /// binding, and says so when it does not (issue #234); with only
+    /// binding, and when it does not, falls back to ephemeral ports rather than
+    /// fail to bind with the inherited shells in hand (issue #234); with only
     /// ephemeral ports it binds at once, the predecessor running or not.
     #[tokio::test(start_paused = true)]
     async fn only_a_fixed_port_waits_for_the_predecessor_to_exit() {
@@ -689,12 +696,30 @@ mod tests {
         fixed[0].port = 4433;
         let started = tokio::time::Instant::now();
 
-        assert!(await_fixed_ports(&ephemeral, || true, grace).await.is_ok());
+        let mut listeners = ephemeral.clone();
+        assert!(
+            await_fixed_ports(&mut listeners, || true, grace)
+                .await
+                .is_ok()
+        );
         assert_eq!(started.elapsed(), Duration::ZERO, "nothing to wait for");
 
-        assert!(await_fixed_ports(&fixed, || false, grace).await.is_ok());
-        let still_running = await_fixed_ports(&fixed, || true, grace).await;
+        let mut listeners = fixed.clone();
+        assert!(
+            await_fixed_ports(&mut listeners, || false, grace)
+                .await
+                .is_ok()
+        );
+        assert_eq!(listeners[0].port, 4433, "bound as configured");
+
+        let still_running = await_fixed_ports(&mut listeners, || true, grace).await;
         assert!(still_running.is_err(), "{still_running:?}");
         assert!(started.elapsed() >= grace);
+        let ports: Vec<u16> = listeners.iter().map(|l| l.port).collect();
+        assert!(
+            ports.iter().all(|&p| p == 0),
+            "ephemeral instead: {ports:?}"
+        );
+        assert_eq!(listeners[0].bind, ephemeral[0].bind, "on the same address");
     }
 }

@@ -186,7 +186,10 @@ their screens replayed. Later restarts between version-3 builds keep them.
   mode. N re-reads the config file, so a restart does apply an edited
   `kmuxd.toml`. A fixed port can be bound by one process at a time and O lets
   go of its listeners only as it exits, so an N with one waits
-  (`PREDECESSOR_EXIT_GRACE`) for O to exit before it binds.
+  (`PREDECESSOR_EXIT_GRACE`) for O to exit before it binds. An O still running
+  after that still holds them, and a failed bind would end N with the
+  inherited shells in hand, so N binds ephemeral ports on the same addresses
+  instead and logs why.
 
 ## Fault tolerance & idempotency
 

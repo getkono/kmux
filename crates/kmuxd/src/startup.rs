@@ -30,7 +30,7 @@ use crate::tls;
 pub async fn async_main(
     daemon: bool,
     handoff: bool,
-    cfg: ServerConfig,
+    mut cfg: ServerConfig,
     successor_args: Vec<OsString>,
 ) -> anyhow::Result<()> {
     info!(backend = term_state::backend_name(), "terminal backend");
@@ -196,7 +196,7 @@ pub async fn async_main(
     // only once the predecessor has let go of them (issue #234).
     if let Some(pid) = predecessor
         && let Err(e) = crate::handoff::receiver::await_fixed_ports(
-            &cfg.listeners,
+            &mut cfg.listeners,
             move || nix::sys::signal::kill(pid, None).is_ok(),
             handoff_timeouts::PREDECESSOR_EXIT_GRACE,
         )
