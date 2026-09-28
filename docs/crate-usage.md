@@ -263,6 +263,7 @@ Keep it that way — the signature scheme and its RNG should come from one crate
 | Compile-time assertions | `static_assertions` | `kmux-ghostty`, to hold `Send`/`Sync` claims over the FFI boundary |
 | Bit flags | `bitflags` | Key modifiers and terminal mode sets, shared across the protocol boundary |
 | Lock-free handoff | `arc-swap` | The off-UI-thread grid publish double-buffer (issue #182) |
+| Character display width | `unicode-width` | `kmuxd`'s restore seed only, to tell a wide cell's narrow base (a grapheme made wide by VS16) from a wide character (issue #236). The 0.2.x already in-tree via `tabled` and `naga` |
 
 ### Rendering
 

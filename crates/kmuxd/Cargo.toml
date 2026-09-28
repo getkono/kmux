@@ -75,6 +75,9 @@ postcard.workspace = true
 # Cross-platform process stats (CPU/memory) for the process overview (issue
 # #122). Used to sample each pane's process tree.
 sysinfo.workspace = true
+# A character's own display width: the restore seed re-widens a grapheme a
+# program made wide with VS16 (issue #236). See src/app/ansi_emit.rs.
+unicode-width.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

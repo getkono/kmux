@@ -100,6 +100,10 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# A character's own display width, for the restore seed (kmuxd) to tell a wide
+# cell holding a narrow base (a grapheme made wide by VS16) from a wide
+# character. Matches the 0.2.x already in the tree (via tabled and wgpu's naga).
+unicode-width = "0.2"
 uniffi = "0.28"
 zstd = "0.13"
 
