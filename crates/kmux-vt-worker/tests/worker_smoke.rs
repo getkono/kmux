@@ -53,14 +53,16 @@ struct Started {
 /// Spawn a worker for `pty` exactly as kmuxd does — the "daemon" keeps the
 /// authoritative master fd and hands the worker a `dup` over a socketpair —
 /// and exchange `Hello` for `Ready`.
-async fn start_worker(pty: &PtyProcess) -> Started {
+async fn start_worker(pty: &PtyProcess) -> anyhow::Result<Started> {
+    use anyhow::Context as _;
+
     // Don't let our drop SIGKILL the child out from under the worker.
     pty.set_keep_alive(true);
     let pid = pty.pid.as_raw();
-    let master_dup = pty.io.dup_owned().expect("dup master fd");
+    let master_dup = pty.io.dup_owned().context("dup master fd")?;
 
     // Socketpair: the worker end is handed to the child on fd 3.
-    let (daemon_end, worker_end) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let (daemon_end, worker_end) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
     let worker_raw = worker_end.as_raw_fd();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kmux-vt-worker"));
@@ -74,12 +76,12 @@ async fn start_worker(pty: &PtyProcess) -> Started {
             Ok(())
         });
     }
-    let worker = cmd.spawn().expect("spawn worker");
+    let worker = cmd.spawn().context("spawn worker")?;
     drop(worker_end); // parent no longer needs the worker end
     let cleanup = KillOnDrop(vec![worker.id().cast_signed(), pid]);
 
-    daemon_end.set_nonblocking(true).expect("nonblocking");
-    let stream = UnixStream::from_std(daemon_end).expect("tokio stream");
+    daemon_end.set_nonblocking(true).context("nonblocking")?;
+    let stream = UnixStream::from_std(daemon_end).context("tokio stream")?;
 
     codec::send_with_fd(
         &stream,
@@ -100,24 +102,24 @@ async fn start_worker(pty: &PtyProcess) -> Started {
         Some(master_dup.as_raw_fd()),
     )
     .await
-    .expect("send Hello");
+    .context("send Hello")?;
     // `master_dup` drops here: the worker holds its own copy now.
     let (ready, _fd) = tokio::time::timeout(
         Duration::from_secs(10),
         codec::recv_with_fd::<WorkerEvent>(&stream),
     )
     .await
-    .expect("Ready within ten seconds")
-    .expect("recv Ready");
-    assert!(
+    .context("Ready within ten seconds")?
+    .context("recv Ready")?;
+    anyhow::ensure!(
         matches!(ready, WorkerEvent::Ready { version } if version == WORKER_PROTOCOL_VERSION),
         "expected Ready, got {ready:?}"
     );
-    Started {
+    Ok(Started {
         worker,
         stream,
         _cleanup: cleanup,
-    }
+    })
 }
 
 /// A worker reads nothing until the daemon has accepted its `Ready`: one the
@@ -143,7 +145,7 @@ async fn a_worker_abandoned_after_ready_leaves_the_output_unread() {
         mut worker,
         stream,
         _cleanup,
-    } = start_worker(&pty).await;
+    } = start_worker(&pty).await.expect("a started worker");
     // The daemon gives up on the worker: it closes its end without `Start`.
     let (mut rd, wr) = stream.into_split();
     drop(wr);
@@ -193,7 +195,7 @@ async fn worker_processes_pty_and_emits_diff() {
         worker: mut child,
         stream,
         _cleanup,
-    } = start_worker(&pty).await;
+    } = start_worker(&pty).await.expect("a started worker");
 
     // Keep the worker, then write input and expect a non-empty cell diff back.
     let (mut rd, mut wr) = stream.into_split();

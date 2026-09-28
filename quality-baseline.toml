@@ -775,7 +775,7 @@ count = 20
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::items_after_statements"
-count = 4
+count = 3
 
 [[lints]]
 crate = "kmuxd"

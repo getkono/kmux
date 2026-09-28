@@ -152,26 +152,24 @@ async fn live_restart_preserves_the_shell(isolated: bool) -> anyhow::Result<()> 
 /// started with. It used to be started with the client's boot arguments, so
 /// a daemon bound to loopback came back bound to every interface.
 #[tokio::test]
-async fn a_restart_keeps_the_listen_addresses() -> anyhow::Result<()> {
-    use anyhow::Context as _;
-
+async fn a_restart_keeps_the_listen_addresses() {
     let sandbox = Sandbox::new();
     let cleanup = Cleanup::default();
-    let (quic, tcp) = free_ports();
+    let (quic, tcp) = free_ports().expect("two free ports");
     let old_pid = Daemon::new(&sandbox).ports(quic, tcp).spawn(None).await;
     cleanup.track(old_pid.cast_signed());
     let before = listening_on(&sandbox.daemon_log());
 
     let accepted = kmux_client::daemon::restart_daemon_at(&sandbox.socket_path())
         .await
-        .context("restart control request")?;
+        .expect("restart control request");
     assert!(
         matches!(accepted, kmux_client::daemon::RestartReply::Accepted { .. }),
         "daemon should accept the graceful handoff"
     );
     let new_pid = wait_for_daemon(&sandbox, Some(old_pid))
         .await
-        .context("a successor daemon should take over")?;
+        .expect("a successor daemon should take over");
     cleanup.track(new_pid.cast_signed());
 
     let log = sandbox.daemon_log();
@@ -188,19 +186,13 @@ async fn a_restart_keeps_the_listen_addresses() -> anyhow::Result<()> {
     );
 
     let _ = kmux_client::daemon::stop_daemon_at(&sandbox.socket_path()).await;
-    Ok(())
 }
 
 /// A QUIC (UDP) and a TCP port on loopback that were free a moment ago.
-fn free_ports() -> (u16, u16) {
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("a free UDP port");
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("a free TCP port");
-    let ports = (
-        udp.local_addr().expect("UDP address").port(),
-        tcp.local_addr().expect("TCP address").port(),
-    );
-    drop((udp, tcp));
-    ports
+fn free_ports() -> std::io::Result<(u16, u16)> {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok((udp.local_addr()?.port(), tcp.local_addr()?.port()))
 }
 
 /// Every network address a daemon logged listening on, in order.
