@@ -2,7 +2,9 @@ use std::path::Path;
 #[cfg(feature = "remote")]
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ResumeFrom, ServerMessage};
+use kmux_protocol::messages::{
+    ClientCapabilities, ClientMessage, FrontendKind, ResumeFrom, ServerMessage,
+};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 #[cfg(feature = "remote")]
 use kmux_sys::tls::{TofuStore, TofuVerifier};
@@ -51,10 +53,11 @@ fn auth_message(
     resume: Option<ResumeFrom>,
     (public_key, hostname, username): (Vec<u8>, String, String),
 ) -> ClientMessage {
+    let client_kind = crate::frontend_kind();
     ClientMessage::Auth {
         token,
         protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
-        protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
+        protocol_capabilities: offered_capabilities(client_kind),
         capabilities,
         connection_id: resume.map(|from| from.connection_id),
         resume_instance: resume.and_then(|from| from.instance),
@@ -64,11 +67,25 @@ fn auth_message(
         // Build identity, so the daemon can attribute the connection and detect a
         // client whose build differs from its own (issue: build skew). The kind
         // is the process-wide frontend; sha/profile come from this binary's build.
-        client_kind: crate::frontend_kind(),
+        client_kind,
         client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),
         client_git_dirty: kmux_protocol::buildinfo::git_dirty(),
         client_build_profile: kmux_protocol::buildinfo::build_profile().to_string(),
     }
+}
+
+/// The named capabilities a `client_kind` process offers: every one this
+/// build implements, except that only a GUI frontend — whose launcher reads a
+/// peer's closed sessions and restores them by peer — offers
+/// `session.closed.peer` (issue #228). A CLI never lists closed sessions, and
+/// a federation hub's link to its peer must not make that peer, when it is a
+/// hub too, fan out to its own peers while the hub's link waits behind it.
+fn offered_capabilities(client_kind: FrontendKind) -> Vec<String> {
+    let gui = matches!(client_kind, FrontendKind::Gtk | FrontendKind::Swift);
+    kmux_protocol::messages::protocol_capabilities()
+        .into_iter()
+        .filter(|c| gui || c != kmux_protocol::messages::CAPABILITY_SESSION_CLOSED_PEER)
+        .collect()
 }
 
 /// This process's identity claim for the `Auth` handshake (issue #146): the
@@ -430,6 +447,20 @@ mod tests {
             }
             other => panic!("expected Auth, got {other:?}"),
         }
+    }
+
+    /// Only a GUI offers `session.closed.peer`: a CLI never lists closed
+    /// sessions, and a hub's link must not make its peer fan out (issue
+    /// #228). Everything else is offered by every kind.
+    #[test]
+    fn only_a_gui_offers_to_read_a_peers_closed_sessions() {
+        use kmux_protocol::messages::{CAPABILITY_SESSION_CLOSED_PEER, protocol_capabilities};
+        for kind in [FrontendKind::Gtk, FrontendKind::Swift] {
+            assert_eq!(offered_capabilities(kind), protocol_capabilities());
+        }
+        let cli = offered_capabilities(FrontendKind::Cli);
+        assert!(!cli.iter().any(|c| c == CAPABILITY_SESSION_CLOSED_PEER));
+        assert_eq!(cli.len(), protocol_capabilities().len() - 1, "{cli:?}");
     }
 
     #[test]

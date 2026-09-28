@@ -444,7 +444,10 @@ typed error, never answered by a hub that does not host it and never dropped.
   word and is tagged with its `peer`; entries a peer lists from a peer of its
   own are dropped (no chained hubs). Peers' entries go only to a client that
   negotiated `session.closed.peer`: an older GUI would restore a peer's word
-  from the hub's own graveyard. `SessionRestore { peer: Some(p) }` is
+  from the hub's own graveyard. Only a GUI frontend offers it
+  (`kmux-connect`'s `offered_capabilities`): a hub's own link to a peer does
+  not, so a peer that is itself a hub never fans out to its peers while the
+  hub's link waits behind it. `SessionRestore { peer: Some(p) }` is
   *forwarded* like `SessionCreate { peer }`: the peer restores from its
   graveyard, and its `SessionCreated` is registered under a fresh local word.
   The launcher groups a peer's closed sessions after the local ones, one peer
