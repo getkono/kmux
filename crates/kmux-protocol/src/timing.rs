@@ -84,6 +84,10 @@ pub const PEER_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// with its own panes only.
 pub const PEER_OVERVIEW_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a hub waits for its peer's closed-session list before answering
+/// without it (issue #228).
+pub const PEER_CLOSED_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+
 // ── Reconnect ───────────────────────────────────────────────────────────────
 
 /// The first delay before re-opening a dropped link (a GUI's, or a hub's to

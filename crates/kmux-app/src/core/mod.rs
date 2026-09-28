@@ -174,10 +174,15 @@ pub enum LaunchRow {
         cwd: String,
         active: bool,
     },
-    /// Restore a closed (inactive) local session from the daemon's graveyard
-    /// (issue #64). Shown in a "Restore" section, ordered most-recently-active
-    /// first. Activating respawns it and attaches.
+    /// Restore a closed (inactive) session from the daemon's graveyard (issue
+    /// #64), or from a federated peer's through it (issue #228). Shown in a
+    /// "Restore" section: the local ones first, then each peer's, peer by
+    /// peer, each group ordered most-recently-active first. Activating
+    /// respawns it where it was closed and attaches.
     ClosedSession {
+        /// The peer whose graveyard holds it (`word_id` is then the peer's
+        /// word); `None` for the daemon's own.
+        peer: Option<PeerId>,
         word_id: String,
         name: String,
         cwd: String,
@@ -210,6 +215,21 @@ pub fn relative_time_label(last_active_ms: u64) -> String {
     } else {
         format!("{}d ago", secs / 86_400)
     }
+}
+
+/// The secondary line of a closed-session row (issues #64, #228): where it
+/// ran — its peer, when it is a peer's — its cwd, and when it was last active.
+/// Frontend-agnostic so GTK and the Swift FFI render the rows alike.
+pub fn closed_session_detail(peer: Option<&str>, cwd: &str, last_active_ms: u64) -> String {
+    [
+        peer.unwrap_or(""),
+        cwd,
+        &relative_time_label(last_active_ms),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 /// Values collected by the add-remote form (issue #121). The frontend owns the
@@ -872,6 +892,18 @@ mod tests {
         let mut core = new_local_core();
         core.is_local = false;
         core
+    }
+
+    /// A closed-session row says where it ran — its peer first, for a peer's —
+    /// and skips what it does not know (issue #228).
+    #[test]
+    fn closed_session_detail_names_the_peer_then_cwd_then_when() {
+        assert_eq!(
+            closed_session_detail(Some("box"), "/srv", 0),
+            "box · /srv · unknown"
+        );
+        assert_eq!(closed_session_detail(None, "/srv", 0), "/srv · unknown");
+        assert_eq!(closed_session_detail(None, "", 0), "unknown");
     }
 
     #[test]

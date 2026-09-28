@@ -260,13 +260,16 @@ impl SessionManager {
         self.send_ws(ClientMessage::SessionListClosed { request_id: rid });
     }
 
-    /// Restore a previously closed session by word id (issue #64). On success the
+    /// Restore a previously closed session by word id (issue #64), from the
+    /// graveyard of `peer` — the closed entry's own `peer`, so a federated
+    /// peer's session is restored through the hub (issue #228). On success the
     /// daemon replies with `SessionCreated`, handled like any new session.
-    pub fn restore_session(&mut self, word_id: &str) {
+    pub fn restore_session(&mut self, word_id: &str, peer: Option<&str>) {
         let rid = self.next_rid();
         self.send_ws(ClientMessage::SessionRestore {
             request_id: rid,
             word_id: word_id.to_string(),
+            peer: peer.map(str::to_string),
         });
     }
 

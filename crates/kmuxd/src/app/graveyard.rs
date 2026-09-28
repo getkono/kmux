@@ -84,6 +84,7 @@ impl ServerApp {
                 last_active_ms: c.session.last_active_ms,
                 closed_at_ms: c.closed_at_ms,
                 pane_count: c.session.panes.len() as u32,
+                peer: None,
             })
             .collect();
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_active_ms));

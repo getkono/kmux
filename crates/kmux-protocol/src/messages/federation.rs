@@ -51,10 +51,11 @@ impl ClientMessage {
         use Federation::{Aggregate, Hub};
         match self {
             Self::SessionCreate {
-                request_id,
-                peer: peer @ Some(_),
-                ..
-            } => forward(Target::Peer(peer), Some(request_id)),
+                request_id, peer, ..
+            }
+            | Self::SessionRestore {
+                request_id, peer, ..
+            } => on_peer(peer, request_id),
             Self::SessionClose {
                 request_id,
                 word_id,
@@ -126,13 +127,11 @@ impl ClientMessage {
             | Self::Resize { .. }
             | Self::RequestInputLock { .. }
             | Self::ReleaseInputLock { .. } => Aggregate,
-            Self::SessionCreate { peer: None, .. }
-            | Self::Auth { .. }
+            Self::Auth { .. }
             | Self::AuthProof { .. }
             | Self::ChannelReady
             | Self::SessionList { .. }
             | Self::SessionListClosed { .. }
-            | Self::SessionRestore { .. }
             | Self::ProcessOverview { .. }
             | Self::SetSnapshotMode { .. }
             | Self::SetPaused { .. }
@@ -147,6 +146,16 @@ impl ClientMessage {
     }
 }
 
+/// A create or a restore: forwarded to the peer it names, the hub's own when
+/// it names none.
+fn on_peer<'a>(peer: &'a mut Option<PeerId>, request_id: &'a mut RequestId) -> Federation<'a> {
+    if peer.is_some() {
+        forward(Target::Peer(peer), Some(request_id))
+    } else {
+        Federation::Hub
+    }
+}
+
 fn forward<'a>(target: Target<'a>, request_id: Option<&'a mut RequestId>) -> Federation<'a> {
     Federation::Forward { target, request_id }
 }
@@ -155,8 +164,8 @@ fn forward<'a>(target: Target<'a>, request_id: Option<&'a mut RequestId>) -> Fed
 /// per-variant property (its category, its federation disposition) to the
 /// code. `spec` checks the list names every variant exactly once, so a new
 /// variant fails the tests until it has a sample here — and so a documented
-/// disposition. `SessionCreate` names a peer: that is the case a hub
-/// forwards.
+/// disposition. `SessionCreate` and `SessionRestore` name a peer: that is
+/// the case a hub forwards.
 #[cfg(test)]
 pub(crate) fn every_client_message() -> Vec<ClientMessage> {
     use super::session::{
@@ -211,6 +220,7 @@ pub(crate) fn every_client_message() -> Vec<ClientMessage> {
         ClientMessage::SessionRestore {
             request_id: 0,
             word_id: word(),
+            peer: Some("box".into()),
         },
         ClientMessage::PaneCreate {
             request_id: 0,
@@ -391,22 +401,30 @@ mod tests {
         ));
     }
 
-    /// Only a create that names a peer is forwarded; one without is the
-    /// hub's own.
+    /// Only a create or a restore that names a peer is forwarded (issue
+    /// #228); one without is the hub's own.
     #[test]
-    fn a_create_is_forwarded_only_when_it_names_a_peer() {
-        let mut create = every_client_message()
+    fn a_create_or_restore_is_forwarded_only_when_it_names_a_peer() {
+        let named_a_peer: Vec<ClientMessage> = every_client_message()
             .into_iter()
-            .find(|m| matches!(m, ClientMessage::SessionCreate { .. }))
-            .expect("the sample");
-        let Federation::Forward {
-            target: Target::Peer(peer),
-            ..
-        } = create.federation()
-        else {
-            panic!("a create naming a peer is forwarded to it");
-        };
-        assert_eq!(peer.take().as_deref(), Some("box"));
-        assert_eq!(create.federation(), Federation::Hub);
+            .filter(|m| {
+                matches!(
+                    m,
+                    ClientMessage::SessionCreate { .. } | ClientMessage::SessionRestore { .. }
+                )
+            })
+            .collect();
+        assert_eq!(named_a_peer.len(), 2, "a create and a restore");
+        for mut msg in named_a_peer {
+            let Federation::Forward {
+                target: Target::Peer(peer),
+                ..
+            } = msg.federation()
+            else {
+                panic!("naming a peer, it is forwarded to it: {msg:?}");
+            };
+            assert_eq!(peer.take().as_deref(), Some("box"));
+            assert_eq!(msg.federation(), Federation::Hub);
+        }
     }
 }

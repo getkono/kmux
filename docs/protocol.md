@@ -169,8 +169,7 @@ last_seqno: None }`) rather than apply it.
 Columns: **Answer** is what the daemon sends the requester (and on failure);
 **Also** is what every connection receives — the requester included; **Idem.** says whether sending the
 message twice has the effect of once; **Cap.** is the capability a sender needs
-before sending it — none today, the column exists so the first one is recorded
-here. A `request_id` is chosen by the client, counts up from 0, and is echoed
+before sending it (or a field of it). A `request_id` is chosen by the client, counts up from 0, and is echoed
 in the reply; `RESYNC_REQUEST_ID` (`u64::MAX`) marks an unsolicited session
 list. A message with no `request_id` field is answered, on failure, with
 `Error { request_id: None }`; so is every request made before the handshake.
@@ -192,8 +191,8 @@ to `ClientMessage::federation`, variant by variant.
 | `SessionList` | `SessionListResult` (local then federated sessions) | — | yes | — | hub: its own sessions and every peer's |
 | `ProcessOverview` | `ProcessOverviewResult` (local and every peer's panes) | — | yes | — | hub: its own panes and every peer's |
 | `SessionRename` | `SessionRenamed` (no `request_id`); `Error SessionNotFound` | `Event SessionRenamed` | yes | — | forwarded |
-| `SessionListClosed` | `ClosedSessionListResult` | — | yes | — | hub: its own closed sessions only (#228) |
-| `SessionRestore` | `SessionCreated`; `Error` | `Event SessionCreated`, `PaneSpawned` | no: a second is `SessionNotFound` | — | hub: its own closed sessions only (#228) |
+| `SessionListClosed` | `ClosedSessionListResult` (local and, for a client that negotiated `session.closed.peer`, every reachable peer's, each tagged with its `peer`; most recently active first) | — | yes | — | hub: its own closed sessions and every peer's |
+| `SessionRestore` | `SessionCreated`; `Error` | `Event SessionCreated`, `PaneSpawned` | no: a second is `SessionNotFound` | `session.closed.peer`, to name a `peer` | forwarded, when `peer` names one (a local restore is the hub's) |
 | `PaneCreate` | `PaneCreated` (the pane opens in a new tab); `Error` | `Event TabCreated`, `PaneSpawned` | no | — | forwarded |
 | `PaneClose` | `PaneClosed`; `Error PaneNotFound` | `Event PaneClosed`, and `LayoutUpdate`, or `Event TabClosed` / `SessionClosed` when it was the last | no: a second is `PaneNotFound` | — | forwarded |
 | `TabCreate` | `TabCreated`; `Error` | `Event TabCreated`, `PaneSpawned` | no | — | forwarded |
@@ -291,8 +290,10 @@ A hub is one client to each peer, speaking for all of its own
 **Federated** column:
 
 - **forwarded** — the message names one session (or a pane of one, or, for
-  `SessionCreate`, a peer). The hub rewrites the word or pane to the peer's
-  and the `request_id` to one of its own, and sends it up the link. The
+  `SessionCreate` and `SessionRestore`, a peer). The hub rewrites the word or
+  pane to the peer's (a restore already names the peer's word: the one its
+  `ClosedSessionEntry` carried), clears a named peer, and rewrites the
+  `request_id` to one of its own, and sends it up the link. The
   answer comes back to the sender alone, under the sender's id and word. A
   `SessionCreated` is registered under a fresh local word first. A
   `SessionClosed` drops the session for every client, after the sender has its
@@ -316,6 +317,13 @@ A hub is one client to each peer, speaking for all of its own
 - **hub** — about the connection, the hub, or every session. The hub answers
   it and sends the peer nothing. `SetSnapshotMode`, `SetPaused` and
   `SetPaneNoAutoPause` apply to a client's proxied panes as to its local ones.
+  `ProcessOverview` and `SessionListClosed` answer with the hub's own and
+  what the hub asks each reachable peer for, on its own account: a peer that
+  does not answer within `PEER_OVERVIEW_TIMEOUT` / `PEER_CLOSED_LIST_TIMEOUT`
+  contributes nothing. A peer's closed session keeps the peer's word and
+  carries its `peer`, which the client names in `SessionRestore` (#228). Only
+  a peer's own closed sessions are listed, not those of a peer behind it:
+  chained hubs are not supported.
 
 **Answers without a `request_id`** — an `Error { request_id: None }`,
 `SessionRenamed`, and the lock replies — go to the client whose message
@@ -484,6 +492,7 @@ stays beside its code.
 | `PEER_CONNECT_TIMEOUT` | 20 s | one attempt to open or re-open a federation link |
 | `PEER_LIST_TIMEOUT` | 10 s | a hub waiting for its peer's session list while opening the link (a forwarded request waits on no timer: see [Federated requests](#federated-requests)) |
 | `PEER_OVERVIEW_TIMEOUT` | 2 s | a hub waiting for its peer's process overview |
+| `PEER_CLOSED_LIST_TIMEOUT` | 2 s | a hub waiting for its peer's closed-session list |
 | `BACKOFF_MIN` | 250 ms | the first delay before re-opening a dropped link (a GUI's or a hub's); doubled per attempt |
 | `BACKOFF_MAX` | 15 s | the longest delay between re-open attempts |
 | `BACKOFF_JITTER_CAP_PERMILLE` | 200 ‰ | the most jitter takes off a delay |
@@ -536,9 +545,6 @@ reconnects ([connection.md](connection.md#automatic-reconnect-issue-208)).
 What the protocol does today that it should not, recorded so it is not
 mistaken for intent:
 
-- **A peer's closed sessions cannot be listed or restored through a hub.**
-  `SessionListClosed` and `SessionRestore` are the hub's own graveyard only
-  (#228).
 - **A peer that is itself a hub** answers a forwarded request only once its
   own peer has, after its `Pong`s, so the first hub cannot route those answers.
   Chained hubs are not supported.

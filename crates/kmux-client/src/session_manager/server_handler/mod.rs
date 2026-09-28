@@ -1294,6 +1294,7 @@ mod tests {
             last_active_ms: 1,
             closed_at_ms: 2,
             pane_count: 1,
+            peer: None,
         });
 
         let events = mgr.handle_server_message(ServerMessage::ClosedSessionListResult {
@@ -1308,6 +1309,7 @@ mod tests {
                 last_active_ms: 10,
                 closed_at_ms: 20,
                 pane_count: 3,
+                peer: None,
             }],
         });
 

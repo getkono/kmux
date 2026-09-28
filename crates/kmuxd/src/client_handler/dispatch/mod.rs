@@ -227,12 +227,14 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::SessionListClosed { request_id } => {
-            session::on_session_list_closed(state, request_id);
+            session::on_session_list_closed(state, request_id).await;
         }
 
+        // One naming a peer went to it before this `match` (`federated::route`).
         ClientMessage::SessionRestore {
             request_id,
             word_id,
+            peer: _,
         } => session::on_session_restore(state, request_id, word_id).await,
 
         ClientMessage::ProcessOverview { request_id } => {

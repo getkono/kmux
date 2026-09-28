@@ -928,51 +928,62 @@ mod tests {
         assert!(!forwarded(ClientMessage::SessionList { request_id: 1 }));
     }
 
-    /// A create on a peer is registered under a fresh local word, and its
-    /// requester is answered with that word (issue #121, now on the one
-    /// path).
+    /// A create on a peer, or a restore of one of the peer's closed sessions,
+    /// goes to the peer with the peer cleared — it acts on itself — and the
+    /// session it answers with is registered under a fresh local word, with
+    /// which its requester is answered (issues #121, #228).
     #[tokio::test(start_paused = true)]
-    async fn a_session_created_on_the_peer_is_registered_under_a_fresh_word() {
-        let mut hub = fixture_hub();
-        let (from, mut answers) = client(1);
-        hub.app
-            .peer_manager
-            .forward(
-                from,
+    async fn a_session_created_or_restored_on_the_peer_is_registered_under_a_fresh_word() {
+        let create = ClientMessage::SessionCreate {
+            request_id: 21,
+            name: Some("work".into()),
+            cwd: None,
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+            peer: Some("peer:1".into()),
+        };
+        let restore = ClientMessage::SessionRestore {
+            request_id: 21,
+            word_id: "newremote".into(),
+            peer: Some("peer:1".into()),
+        };
+        for request in [create, restore] {
+            let mut hub = fixture_hub();
+            let (from, mut answers) = client(1);
+            hub.app.peer_manager.forward(from, request).unwrap();
+            let sent = next_request(&mut hub.upstream).await;
+            let (id, peer_kept) = match &sent {
                 ClientMessage::SessionCreate {
-                    request_id: 21,
-                    name: Some("work".into()),
-                    cwd: None,
-                    program: None,
-                    args: vec![],
-                    size: TermSize::default(),
-                    peer: Some("peer:1".into()),
-                },
-            )
-            .unwrap();
-        let sent = next_request(&mut hub.upstream).await;
-        let ClientMessage::SessionCreate {
-            request_id: id,
-            peer: None,
-            ..
-        } = sent
-        else {
-            panic!("the peer creates it on itself: {sent:?}");
-        };
-        hub.peer
-            .send(ServerMessage::SessionCreated {
-                request_id: id,
-                entry: crate::federation::sample_remote_entry("newremote"),
-            })
-            .unwrap();
-        let ServerMessage::SessionCreated { request_id, entry } = answer(&mut answers).await else {
-            panic!("a SessionCreated");
-        };
-        assert_eq!(request_id, 21);
-        let word = entry.meta.word_id;
-        assert_ne!(word, "newremote", "a word of the hub's own");
-        assert!(hub.app.is_federated_session(&word));
-        assert_eq!(entry.peer.as_deref(), Some("peer:1"));
+                    request_id, peer, ..
+                } => (*request_id, peer.clone()),
+                ClientMessage::SessionRestore {
+                    request_id,
+                    word_id,
+                    peer,
+                } => {
+                    assert_eq!(word_id, "newremote", "the peer's own word");
+                    (*request_id, peer.clone())
+                }
+                other => panic!("a create or a restore: {other:?}"),
+            };
+            assert_eq!(peer_kept, None, "the peer acts on itself: {sent:?}");
+            hub.peer
+                .send(ServerMessage::SessionCreated {
+                    request_id: id,
+                    entry: crate::federation::sample_remote_entry("newremote"),
+                })
+                .unwrap();
+            let ServerMessage::SessionCreated { request_id, entry } = answer(&mut answers).await
+            else {
+                panic!("a SessionCreated");
+            };
+            assert_eq!(request_id, 21);
+            let word = entry.meta.word_id;
+            assert_ne!(word, "newremote", "a word of the hub's own");
+            assert!(hub.app.is_federated_session(&word));
+            assert_eq!(entry.peer.as_deref(), Some("peer:1"));
+        }
     }
 
     /// The hub arbitrates the input lock between its own clients and holds
