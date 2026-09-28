@@ -651,6 +651,7 @@ mod tests {
             last_active_ms: 0,
         });
         assert_eq!(r.kind, FfiLaunchRowKind::ClosedSession);
+        assert_eq!(r.label, "proj");
         assert_eq!(r.peer.as_deref(), Some("alice@box"));
         assert_eq!(r.word_id.as_deref(), Some("kite"));
         assert_eq!(r.detail, "alice@box · /srv · unknown");

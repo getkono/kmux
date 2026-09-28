@@ -640,6 +640,28 @@ mod tests {
         }
     }
 
+    /// A restore from a client that predates `peer` decodes as one from this
+    /// daemon's own graveyard (issue #228).
+    #[test]
+    fn a_restore_without_a_peer_restores_the_daemons_own() {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type", content = "data")]
+        enum OlderClientMessage {
+            SessionRestore { request_id: u64, word_id: String },
+        }
+        let older = OlderClientMessage::SessionRestore {
+            request_id: 8,
+            word_id: "eagle".to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&older).expect("serialize");
+        match crate::decode_client(&bytes).expect("decode") {
+            ClientMessage::SessionRestore { word_id, peer, .. } => {
+                assert_eq!((word_id.as_str(), peer), ("eagle", None));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[test]
     fn channel_ready_and_switched_roundtrip() {
         let ready = ClientMessage::ChannelReady;
