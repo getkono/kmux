@@ -10,6 +10,7 @@
 //!
 //! ```text
 //!  daemon ──Hello+fd──▶ worker: adopt PTY, build TermState ──Ready──▶ daemon
+//!  daemon ──Start──▶ worker: only now read the PTY
 //!  daemon ──Input/Keys/Resize/…──▶ worker ──Diff/Cursor/Title/…──▶ daemon
 //! ```
 //!
@@ -176,10 +177,17 @@ async fn run() -> anyhow::Result<()> {
     )
     .await
     .context("send Ready")?;
-    debug!(pane_id, "worker ready");
 
     // --- Steady state: split the socket for concurrent I/O. ---
     let (mut sock_rd, mut sock_wr) = stream.into_split();
+    // Read nothing until the daemon keeps us: one that gave up on this worker
+    // (its `Ready` came too late) runs the pane in-process, which must find
+    // every byte of the pane's output still in the PTY. `Start` is the first
+    // streamed frame, read without reading past it.
+    match codec::recv_msg::<_, WorkerRequest>(&mut sock_rd).await {
+        Ok(Some(WorkerRequest::Start)) => debug!(pane_id, "worker started"),
+        other => anyhow::bail!("the daemon did not keep this worker: {other:?}"),
+    }
     // A handoff's hold on the PTY reader: `Some(id)` while one is asked for.
     let (hold_tx, hold_rx) = watch::channel(None);
 
@@ -411,8 +419,8 @@ async fn handle_request(req: WorkerRequest, shared: &Shared<'_>) -> bool {
         ..
     } = *shared;
     match req {
-        WorkerRequest::Hello { .. } => {
-            warn!("worker: unexpected Hello after handshake; ignoring");
+        WorkerRequest::Hello { .. } | WorkerRequest::Start => {
+            warn!("worker: unexpected {req:?} after handshake; ignoring");
         }
         WorkerRequest::Input { data } => {
             if let Err(e) = writer.write_all(&data).await {

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -24,7 +25,14 @@ use crate::persist::checkpoint::{Checkpointer, PeriodicCheckpointer};
 use crate::term_state;
 use crate::tls;
 
-pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyhow::Result<()> {
+/// Run the daemon. `successor_args` are what a graceful-restart successor is
+/// started with (see `successor_args` in `main.rs`).
+pub async fn async_main(
+    daemon: bool,
+    handoff: bool,
+    mut cfg: ServerConfig,
+    successor_args: Vec<OsString>,
+) -> anyhow::Result<()> {
     info!(backend = term_state::backend_name(), "terminal backend");
 
     // Diagnostics (issue #72): log whether network impairment / frame tracing
@@ -182,6 +190,19 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         tokio::spawn(crate::supervisor::supervise("checkpoint", move || {
             checkpoint_loop(Arc::clone(&persist_app), periodic.clone())
         }));
+    }
+
+    // A successor takes over its predecessor's listeners: with a fixed port,
+    // only once the predecessor has let go of them (issue #234).
+    if let Some(pid) = predecessor
+        && let Err(e) = crate::handoff::receiver::await_fixed_ports(
+            &mut cfg.listeners,
+            move || nix::sys::signal::kill(pid, None).is_ok(),
+            handoff_timeouts::PREDECESSOR_EXIT_GRACE,
+        )
+        .await
+    {
+        warn!("{e:#}");
     }
 
     // ── Build and bind all configured listeners ────────────────────────────────
@@ -375,7 +396,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             _ = shutdown.notified() => { info!("Shutdown requested via control socket"); break; }
             _ = restart.notified(), if in_flight.is_none() => {
                 info!("Graceful restart requested; beginning live PTY handoff");
-                in_flight = Some(HandoffInFlight::start(&app, checkpointer.take()));
+                in_flight = Some(HandoffInFlight::start(&app, checkpointer.take(), &successor_args));
             }
             (handoff, ended) = handoff_ended(&mut in_flight) => {
                 // `handoff_ended` took the finished handoff out of `in_flight`
@@ -497,15 +518,28 @@ struct Settled {
 }
 
 impl HandoffInFlight {
-    /// Start a handoff that owns `checkpointer` until it ends.
-    fn start(app: &Arc<ServerApp>, checkpointer: Option<Checkpointer>) -> Self {
+    /// Start a handoff that owns `checkpointer` until it ends, to a
+    /// successor started with `successor_args`.
+    fn start(
+        app: &Arc<ServerApp>,
+        checkpointer: Option<Checkpointer>,
+        successor_args: &[OsString],
+    ) -> Self {
         let committed = Arc::new(AtomicBool::new(false));
+        let successor_args = successor_args.to_vec();
         let (cancel, signal) = Cancel::channel();
         let app = Arc::clone(app);
         let flag = Arc::clone(&committed);
         let task = tokio::spawn(async move {
             let mut checkpointer = checkpointer;
-            let result = crate::handoff::sender::run(&app, &mut checkpointer, &flag, signal).await;
+            let result = crate::handoff::sender::run(
+                &app,
+                &mut checkpointer,
+                &flag,
+                signal,
+                &successor_args,
+            )
+            .await;
             (result, checkpointer)
         });
         Self {

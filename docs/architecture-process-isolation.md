@@ -80,6 +80,15 @@ The worker must answer `Hello` with `Ready` within `READY_TIMEOUT` (10 s, issue
 the spot, and pane creation falls back to the in-process engine instead of
 hanging.
 
+The daemon answers an accepted `Ready` with `Start` — the first streamed frame
+— and the worker reads the PTY only once it has it (issue #234,
+`WORKER_PROTOCOL_VERSION` 2 → 3). A worker used to start reading as soon as it
+had sent `Ready`, so one whose `Ready` arrived just after the daemon gave up on
+it consumed output that the in-process engine taking the pane over then never
+saw. Now a worker the daemon abandons during the handshake has read nothing:
+every byte the pane printed is still in the PTY for the fallback. A worker
+that gets any other frame, or finds the link closed, exits without reading.
+
 **The daemon retains the authoritative master fd** (the worker holds a dup).
 This is the load-bearing invariant: when the worker dies, the daemon's fd keeps
 the PTY's file description open, so the shell receives no SIGHUP and survives.

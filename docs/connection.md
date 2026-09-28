@@ -717,7 +717,7 @@ Once the binary is located, `start_daemon_in()` spawns it with the canonical arg
 kmuxd --daemon --bind 0.0.0.0 --port 0
 ```
 
-This constant is defined in `crates/kmux-protocol/src/control_rpc.rs::DAEMON_BOOT_ARGS` and is the single source of truth for every spawn site.
+This constant is defined in `crates/kmux-protocol/src/control_rpc.rs::DAEMON_BOOT_ARGS` and is the single source of truth for every site that starts a fresh daemon. A graceful-restart successor is the exception: it is started with its predecessor's own flags, so a restart keeps the listeners the running daemon had (see `docs/daemon-handoff.md`).
 
 ### Server-side (`kmuxd probe-or-start`)
 

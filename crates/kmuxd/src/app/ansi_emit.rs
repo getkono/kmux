@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{CellAttrs, CellState, GridSnapshot, SequenceNo};
+use kmux_protocol::messages::{CellAttrs, CellColor, CellState, GridSnapshot, SequenceNo};
 
 use crate::diff_engine::DiffResult;
 use crate::lock::lock_term_state;
@@ -73,66 +73,96 @@ fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
     out.extend_from_slice(b"\r\n");
 }
 
-/// Emit one row of cells as ANSI bytes into `out`, ending with the SGR reset.
+/// Emit one row of cells as ANSI bytes into `out`, ending with the SGR reset,
+/// so that a fresh emulator fed them holds the same cells: characters,
+/// colours and every attribute.
 ///
-/// Trailing spaces are trimmed.  SGR sequences are coalesced so that only one
+/// Only trailing blanks of the default style are trimmed — a fresh emulator
+/// holds those already — while a coloured or underlined blank is content. A
+/// wide character's spacer cell is not written: the emulator makes it when
+/// it writes the character, and the cell after it is placed by column. SGR sequences are coalesced so that only one
 /// escape is emitted per style-change boundary.
 fn emit_cells(out: &mut Vec<u8>, cells: &[CellState]) {
-    use std::fmt::Write as FmtWrite;
+    use std::io::Write as _;
 
-    let last_content = cells
+    let end = cells
         .iter()
-        .rposition(|cell| cell.c != ' ')
+        .rposition(|cell| !is_default_blank(cell))
         .map_or(0, |i| i + 1);
 
-    #[derive(PartialEq)]
-    struct StyleKey {
-        fg: (u8, u8, u8),
-        bg: (u8, u8, u8),
-        attrs: u16,
-    }
-
-    if last_content > 0 {
-        let mut prev_key: Option<StyleKey> = None;
-
-        for cell in &cells[..last_content] {
-            let style_key = StyleKey {
-                fg: (cell.fg.r, cell.fg.g, cell.fg.b),
-                bg: (cell.bg.r, cell.bg.g, cell.bg.b),
-                attrs: cell.attrs.0,
-            };
-            if prev_key.as_ref() != Some(&style_key) {
-                prev_key = Some(style_key);
-                let mut sgr = String::from("\x1b[0");
-                if cell.attrs.contains(CellAttrs::BOLD) {
-                    sgr.push_str(";1");
-                }
-                if cell.attrs.contains(CellAttrs::DIM) {
-                    sgr.push_str(";2");
-                }
-                if cell.attrs.contains(CellAttrs::ITALIC) {
-                    sgr.push_str(";3");
-                }
-                if cell.attrs.contains(CellAttrs::UNDERLINE) {
-                    sgr.push_str(";4");
-                }
-                if !cell.attrs.contains(CellAttrs::DEFAULT_FG) {
-                    let _ = write!(sgr, ";38;2;{};{};{}", cell.fg.r, cell.fg.g, cell.fg.b);
-                }
-                if !cell.attrs.contains(CellAttrs::DEFAULT_BG) {
-                    let _ = write!(sgr, ";48;2;{};{};{}", cell.bg.r, cell.bg.g, cell.bg.b);
-                }
-                sgr.push('m');
-                out.extend_from_slice(sgr.as_bytes());
-            }
-
-            let mut buf = [0u8; 4];
-            let s = cell.c.encode_utf8(&mut buf);
-            out.extend_from_slice(s.as_bytes());
+    let mut prev_style: Option<(CellColor, CellColor, CellAttrs)> = None;
+    for (col, cell) in cells[..end].iter().enumerate() {
+        if cell.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let style = (cell.fg, cell.bg, cell.attrs);
+        if prev_style != Some(style) {
+            prev_style = Some(style);
+            out.extend_from_slice(sgr_for(cell).as_bytes());
+        }
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        // A wide cell's character may be narrow on its own — the base of a
+        // grapheme a program made wide (VS16 under mode 2027), stored without
+        // the rest — so the next cell is placed by column, not by width.
+        if cell.attrs.contains(CellAttrs::WIDE_CHAR) {
+            let _ = write!(out, "\x1b[{}G", col + 3);
         }
     }
 
     out.extend_from_slice(b"\x1b[0m");
+}
+
+/// Each attribute and the SGR parameter that sets it.
+const SGR_ATTRS: [(u16, &str); 8] = [
+    (CellAttrs::BOLD, "1"),
+    (CellAttrs::DIM, "2"),
+    (CellAttrs::ITALIC, "3"),
+    (CellAttrs::UNDERLINE, "4"),
+    (CellAttrs::BLINK, "5"),
+    (CellAttrs::INVERSE, "7"),
+    (CellAttrs::HIDDEN, "8"),
+    (CellAttrs::STRIKETHROUGH, "9"),
+];
+
+/// Whether `cell` is a blank of the default style: what a fresh emulator
+/// holds in a cell nothing was written to.
+fn is_default_blank(cell: &CellState) -> bool {
+    cell.c == ' ' && cell.attrs == CellState::default().attrs
+}
+
+/// The SGR sequence that sets `cell`'s style from scratch.
+///
+/// An inverse cell's colours are stored as displayed — foreground and
+/// background swapped, `DEFAULT_FG`/`DEFAULT_BG` with them — so they are
+/// swapped back to the colours the program set, which SGR 7 swaps again.
+fn sgr_for(cell: &CellState) -> String {
+    use std::fmt::Write as _;
+
+    let attrs = cell.attrs;
+    let mut sgr = String::from("\x1b[0");
+    for (flag, param) in SGR_ATTRS {
+        if attrs.contains(flag) {
+            sgr.push(';');
+            sgr.push_str(param);
+        }
+    }
+    let displayed = [
+        (cell.fg, attrs.contains(CellAttrs::DEFAULT_FG)),
+        (cell.bg, attrs.contains(CellAttrs::DEFAULT_BG)),
+    ];
+    let [fg, bg] = if attrs.contains(CellAttrs::INVERSE) {
+        [displayed[1], displayed[0]]
+    } else {
+        displayed
+    };
+    for (param, (color, is_default)) in [("38", fg), ("48", bg)] {
+        if !is_default {
+            let _ = write!(sgr, ";{param};2;{};{};{}", color.r, color.g, color.b);
+        }
+    }
+    sgr.push('m');
+    sgr
 }
 
 /// Feed preamble bytes into `term_state`, compute the resulting diff, and push
@@ -208,31 +238,111 @@ mod tests {
     /// it was. A line break after the last row once scrolled the whole screen
     /// up a line, taking the top row into the history — a fresh shell's
     /// prompt, which is often all there is.
+    ///
+    /// Cell for cell, with every attribute (issue #234): each SGR attribute,
+    /// alone and together, an inverse cell with colours of its own, a wide
+    /// character, and blanks that are coloured or underlined — at the end of
+    /// a row, where plain blanks are trimmed — on the screen and in the
+    /// history alike.
     #[test]
     fn an_inherited_screen_is_seeded_exactly() {
-        let before = fixture_term_state(4, 20);
-        // Styled cells, so the seed has to reproduce attributes and colours,
-        // not just text.
-        lock_term_state(&before)
-            .feed(b"\x1b[1;31mtop\x1b[0m\r\n\r\nthird\r\n\x1b[4;44mlast\x1b[0m\x1b[2;3H");
+        let before = fixture_term_state(4, 30);
+        lock_term_state(&before).feed(
+            concat!(
+                // Scrolls into the history: a styled line, ending in styled blanks.
+                "\x1b[1;4;38;2;9;8;7mold\x1b[0m\x1b[41m  \x1b[0m\r\n",
+                "\x1b[1;31mtop\x1b[0m \x1b[2mdim\x1b[0m \x1b[3mit\x1b[0m \x1b[4mund\x1b[0m\r\n",
+                "\x1b[5mbl\x1b[0m \x1b[7minv\x1b[0m \x1b[8mhid\x1b[0m \x1b[9mstr\x1b[0m ",
+                "\x1b[7;38;2;1;2;3;48;2;4;5;6mboth\x1b[0m\r\n",
+                "wide \u{4e16}\u{754c} \x1b[1;2;3;4;5;7;8;9mall\x1b[0m\r\n",
+                "\x1b[44mbg\x1b[4m  \x1b[0m\x1b[7m \x1b[0m",
+                "\x1b[2;3H",
+            )
+            .as_bytes(),
+        );
         let snapshot = lock_term_state(&before).snapshot();
-        let mut history = vec![CellState::default(); 20];
-        for (cell, c) in history.iter_mut().zip("older".chars()) {
-            cell.c = c;
-        }
+        let history = read_history(&before);
+        assert_eq!(history.len(), 1, "one line scrolled off");
 
-        let after = fixture_term_state(4, 20);
-        let preamble = snapshot_to_ansi(&snapshot, &[history], false);
+        let after = fixture_term_state(4, 30);
+        let preamble = snapshot_to_ansi(&snapshot, &history, false);
         let diffs = Arc::new(Mutex::new(DiffBuffer::new(64 * 1024)));
         seed_pane_with_preamble(&after, &diffs, &Arc::new(AtomicU64::new(1)), &preamble);
         let seeded = lock_term_state(&after).snapshot();
 
-        assert_eq!(rows_of(&seeded), ["top", "", "third", "last"]);
-        assert!(
-            seeded.cells == snapshot.cells,
-            "every cell, styled as it was"
+        assert_eq!(
+            rows_of(&seeded),
+            [
+                "top dim it und",
+                "bl inv hid str both",
+                "wide \u{4e16} \u{754c}  all",
+                "bg",
+            ]
         );
+        for (i, (got, want)) in seeded.cells.iter().zip(&snapshot.cells).enumerate() {
+            let (row, col) = (i / 30, i % 30);
+            assert_eq!(got, want, "screen cell at row {row}, column {col}");
+        }
+        assert_eq!(read_history(&after), history, "the history, cell for cell");
         assert_eq!((seeded.cursor.row, seeded.cursor.col), (1, 2));
         assert_eq!(seeded.history_total, 1, "the one history line, no more");
+    }
+
+    /// A row's trailing blanks of the default style are not written — a fresh
+    /// emulator holds them already — while a styled blank is, and so is a
+    /// default blank with content after it (issue #234).
+    #[test]
+    fn only_trailing_default_blanks_are_left_out() {
+        fn text(s: &str) -> impl Iterator<Item = CellState> + '_ {
+            s.chars().map(|c| CellState {
+                c,
+                ..CellState::default()
+            })
+        }
+        let mut underlined = CellState::default();
+        underlined.attrs.0 |= CellAttrs::UNDERLINE;
+        let emitted = |cells: Vec<CellState>| {
+            let mut out = Vec::new();
+            emit_cells(&mut out, &cells);
+            String::from_utf8(out).unwrap()
+        };
+
+        assert_eq!(emitted(text("a b  ").collect()), "\x1b[0ma b\x1b[0m");
+        let styled = text("a").chain([underlined]).chain(text(" ")).collect();
+        assert_eq!(emitted(styled), "\x1b[0ma\x1b[0;4m \x1b[0m");
+        assert_eq!(emitted(text("   ").collect()), "\x1b[0m");
+    }
+
+    /// A wide cell whose stored character is narrow on its own — a grapheme
+    /// made wide by VS16 under mode 2027, stored as its base — leaves the rest
+    /// of the row where it was (issue #234).
+    #[test]
+    fn a_grapheme_made_wide_keeps_the_rest_of_its_row_in_place() {
+        let before = fixture_term_state(1, 10);
+        lock_term_state(&before).feed("\x1b[?2027h\u{26a0}\u{fe0f}after".as_bytes());
+        let snapshot = lock_term_state(&before).snapshot();
+        assert!(
+            snapshot.cells[0].attrs.contains(CellAttrs::WIDE_CHAR),
+            "the emulator made it wide"
+        );
+
+        let after = fixture_term_state(1, 10);
+        let preamble = snapshot_to_ansi(&snapshot, &[], false);
+        let diffs = Arc::new(Mutex::new(DiffBuffer::new(64 * 1024)));
+        seed_pane_with_preamble(&after, &diffs, &Arc::new(AtomicU64::new(1)), &preamble);
+        let seeded = lock_term_state(&after).snapshot();
+
+        let text = |s: &GridSnapshot| s.cells[2..7].iter().map(|c| c.c).collect::<String>();
+        assert_eq!(text(&seeded), text(&snapshot));
+        assert_eq!(text(&seeded), "after");
+    }
+
+    /// Every line in `term`'s history, oldest first.
+    fn read_history(term: &Arc<Mutex<TermState>>) -> Vec<Vec<CellState>> {
+        let term = lock_term_state(term);
+        term.read_history_lines(0, term.history_size())
+            .iter()
+            .map(|line| line.to_vec())
+            .collect()
     }
 }

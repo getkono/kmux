@@ -252,6 +252,8 @@ pub struct Daemon<'a> {
     isolation: Option<&'static str>,
     extra_env: Vec<(String, PathBuf)>,
     config: Option<PathBuf>,
+    /// `--port` and `--tcp-port`; ephemeral (`0`) by default.
+    ports: (u16, u16),
 }
 
 impl<'a> Daemon<'a> {
@@ -264,7 +266,15 @@ impl<'a> Daemon<'a> {
             isolation: None,
             extra_env: Vec::new(),
             config: None,
+            ports: (0, 0),
         }
+    }
+
+    /// Listen on these QUIC and TCP+TLS ports rather than ephemeral ones.
+    #[must_use]
+    pub fn ports(mut self, quic: u16, tcp: u16) -> Self {
+        self.ports = (quic, tcp);
+        self
     }
 
     /// Run with `toml` as its `kmuxd.toml` (`--config`).
@@ -299,14 +309,15 @@ impl<'a> Daemon<'a> {
     /// `exclude` skips a pid that is already listening — the handoff suite uses
     /// it to wait for the *successor* rather than re-observing the predecessor.
     pub async fn spawn(self, exclude: Option<u32>) -> u32 {
+        let (quic, tcp) = (self.ports.0.to_string(), self.ports.1.to_string());
         let mut args: Vec<&std::ffi::OsStr> = [
             "--daemon",
             "--bind",
             "127.0.0.1",
             "--port",
-            "0",
+            &quic,
             "--tcp-port",
-            "0",
+            &tcp,
         ]
         .map(std::ffi::OsStr::new)
         .to_vec();

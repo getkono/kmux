@@ -224,6 +224,11 @@ A shard that never ran leaves nothing, and the other three merged would read
 as a clean diff; the weekly sweep's judge counts its eight shards the same way,
 for the same reason.
 
+Neither run writes the cargo cache every other CI job restores. The diff
+shards only restore it; the weekly sweep warm-starts from it but saves under a
+key of its own (`<os>-cargo-mutants-<Cargo.lock hash>`), so what a sweep leaves
+in `target/` never becomes what the next CI job builds on.
+
 Scoping flags are forwarded to every crate-group pass and echoed on each `==>`
 line, so a CI log says what was actually swept rather than implying it. A group
 with nothing in scope passes; a group that exits non-zero having written no

@@ -211,6 +211,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // What a graceful-restart successor is started with, built here where
+    // this daemon resolves its paths: from the flags it was started with.
+    let successor_args = successor_args(&cli);
+
     // Load the config before logging starts: it says how the log rotates.
     let (mut cfg_file, cfg_source) = config::load_config(cli.config.as_deref())?;
 
@@ -333,7 +337,7 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(
-        startup::async_main(cli.daemon, cli.handoff, server_cfg)
+        startup::async_main(cli.daemon, cli.handoff, server_cfg, successor_args)
             .instrument(tracing::info_span!("instance", id = %instance_id)),
     );
 
@@ -625,6 +629,54 @@ pub(crate) fn boot_log_stdio() -> (std::process::Stdio, std::process::Stdio) {
     }
 }
 
+/// The arguments a graceful-restart successor is started with (issue #234):
+/// `--daemon --handoff`, and every flag `cli` carries that shapes what a
+/// daemon serves — its config file, listeners, certificate and pane
+/// isolation — so the successor serves exactly what this daemon does. It
+/// used to get the client's boot arguments instead, so a daemon bound to
+/// loopback came back from a restart bound to every interface.
+///
+/// Paths are made absolute against this process's working directory, where
+/// this daemon resolves them; the successor starts in `/`. One that cannot be
+/// (an empty path) is passed as given, to fail in the successor as it would
+/// have here: building these never stops this daemon from starting.
+fn successor_args(cli: &Cli) -> Vec<std::ffi::OsString> {
+    use clap::ValueEnum as _;
+    use std::ffi::OsString;
+
+    let absolute = |path: &std::path::Path| -> OsString {
+        std::path::absolute(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .into_os_string()
+    };
+    let mut args: Vec<OsString> = vec!["--daemon".into(), "--handoff".into()];
+    let mut flag = |name: &str, value: OsString| args.extend([name.into(), value]);
+    if let Some(config) = &cli.config {
+        flag("--config", absolute(config));
+    }
+    if let Some(bind) = &cli.bind {
+        flag("--bind", bind.into());
+    }
+    if let Some(port) = cli.port {
+        flag("--port", port.to_string().into());
+    }
+    if let Some(port) = cli.tcp_port {
+        flag("--tcp-port", port.to_string().into());
+    }
+    if let Some(cert) = &cli.cert {
+        flag("--cert", absolute(cert.as_ref()));
+    }
+    if let Some(key) = &cli.key {
+        flag("--key", absolute(key.as_ref()));
+    }
+    if let Some(mode) = cli.session_isolation
+        && let Some(value) = mode.to_possible_value()
+    {
+        flag("--session-isolation", value.get_name().into());
+    }
+    args
+}
+
 fn generate_instance_id() -> String {
     let mut bytes = [0u8; 4];
     rand::rng().fill_bytes(&mut bytes);
@@ -635,7 +687,63 @@ fn generate_instance_id() -> String {
 mod tests {
     use kmux_protocol::control_rpc::HANDOFF_STOOD_DOWN_EXIT_CODE;
 
-    use super::{ssh_view, stood_down_exit_code};
+    use clap::Parser as _;
+
+    use super::{Cli, ssh_view, stood_down_exit_code, successor_args};
+    use crate::config::SessionIsolationMode;
+
+    /// A successor is started with every flag that shapes what its
+    /// predecessor serves, meaning to it what it meant to the predecessor
+    /// (issue #234): parsed back, each is the predecessor's, its paths
+    /// absolute. A daemon started with none passes none on, so the config
+    /// file decides for both.
+    #[test]
+    fn a_successor_is_started_with_what_shapes_its_predecessor() {
+        let cli = Cli::try_parse_from([
+            "kmuxd",
+            "--daemon",
+            "--config",
+            "kmuxd.toml",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "4433",
+            "--tcp-port",
+            "4434",
+            "--cert",
+            "cert.pem",
+            "--key",
+            "/etc/kmuxd/key.pem",
+            "--session-isolation",
+            "process",
+        ])
+        .unwrap();
+
+        let args = successor_args(&cli);
+        let successor =
+            Cli::try_parse_from(std::iter::once("kmuxd".into()).chain(args.clone())).unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        assert!(successor.daemon && successor.handoff);
+        assert_eq!(successor.config, Some(cwd.join("kmuxd.toml")));
+        assert_eq!(successor.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            (successor.port, successor.tcp_port),
+            (Some(4433), Some(4434))
+        );
+        let cert = cwd.join("cert.pem").display().to_string();
+        assert_eq!(successor.cert, Some(cert));
+        assert_eq!(successor.key.as_deref(), Some("/etc/kmuxd/key.pem"));
+        assert_eq!(
+            successor.session_isolation,
+            Some(SessionIsolationMode::Process)
+        );
+
+        let bare = Cli::try_parse_from(["kmuxd", "--daemon"]).unwrap();
+        assert_eq!(successor_args(&bare), ["--daemon", "--handoff"]);
+        // A successor's own successor is started the same way.
+        assert_eq!(successor_args(&successor), args);
+    }
 
     /// `probe-or-start` hands back the daemon's SSH view as it is, and builds
     /// one from the ports — the TCP+TLS listener as `ssh-only` — only for a

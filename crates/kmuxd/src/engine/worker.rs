@@ -12,7 +12,8 @@
 //! synchronous attach/resize call sites unchanged.
 //!
 //! Nothing about a worker may hang the daemon (issue #207). The worker must
-//! answer `Hello` within [`READY_TIMEOUT`]; its child handle is a
+//! answer `Hello` within [`READY_TIMEOUT`], and reads the PTY only once the
+//! daemon has answered its `Ready` with `Start`; its child handle is a
 //! `tokio::process::Child`, waited on asynchronously, never with a blocking
 //! `wait` on a runtime thread; a stream that goes bad gets the worker killed
 //! before it is reaped; and a worker that leaves a heartbeat `Ping` unanswered
@@ -45,6 +46,7 @@ use kmux_worker_protocol::{
 };
 use tokio::io::AsyncRead;
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::Child;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -196,8 +198,10 @@ impl WorkerEngine {
             .context("worker socket nonblocking")?;
         let stream = UnixStream::from_std(daemon_end).context("adopt worker socket")?;
 
-        // Handshake: Hello (carrying the PTY fd) -> Ready. A worker that
-        // fails it, or never answers, is killed and reaped here.
+        // Handshake: Hello (carrying the PTY fd) -> Ready -> Start. A worker
+        // that fails it, or never answers, is killed and reaped here, never
+        // having been told to start: the pane's output is all still in the
+        // PTY for the in-process engine the caller falls back to.
         let hello = WorkerRequest::Hello {
             version: WORKER_PROTOCOL_VERSION,
             pane_id: fanout.pane_id.clone(),
@@ -207,17 +211,20 @@ impl WorkerEngine {
             kitty_graphics,
             kitty_keyboard,
         };
-        if let Err(e) = handshake(&stream, &hello, master_fd, READY_TIMEOUT).await {
-            let _ = child.kill().await;
-            return Err(e);
-        }
+        let (sock_rd, mut sock_wr) = match handshake(stream, &hello, master_fd, READY_TIMEOUT).await
+        {
+            Ok(halves) => halves,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Err(e);
+            }
+        };
 
         let mirror = Arc::new(Mutex::new(CellGrid::new(
             size.rows.max(1) as usize,
             size.cols.max(1) as usize,
         )));
 
-        let (sock_rd, mut sock_wr) = stream.into_split();
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WorkerRequest>();
         let (input_tx, mut input_rx) = mpsc::channel::<WorkerRequest>(INPUT_QUEUE_CAPACITY);
 
@@ -392,25 +399,27 @@ async fn write_requests(
     }
 }
 
-/// Send `Hello` with the PTY master fd and wait up to `timeout` for a `Ready`
-/// carrying this build's protocol version. The master is closed on our side
-/// once sent: the worker holds its own dup.
+/// Send `Hello` with the PTY master fd, wait up to `timeout` for a `Ready`
+/// carrying this build's protocol version, then tell the worker to `Start`
+/// and hand back the split stream. The master is closed on our side once
+/// sent: the worker holds its own dup. A worker that fails the handshake is
+/// never told to start, so it has read none of the pane's output.
 async fn handshake(
-    stream: &UnixStream,
+    stream: UnixStream,
     hello: &WorkerRequest,
     master_fd: OwnedFd,
     timeout: Duration,
-) -> anyhow::Result<()> {
-    codec::send_with_fd(stream, hello, Some(master_fd.as_raw_fd()))
+) -> anyhow::Result<(OwnedReadHalf, OwnedWriteHalf)> {
+    codec::send_with_fd(&stream, hello, Some(master_fd.as_raw_fd()))
         .await
         .context("send Hello")?;
     drop(master_fd);
-    let (ready, _fd) = tokio::time::timeout(timeout, codec::recv_with_fd::<WorkerEvent>(stream))
+    let (ready, _fd) = tokio::time::timeout(timeout, codec::recv_with_fd::<WorkerEvent>(&stream))
         .await
         .map_err(|_| anyhow::anyhow!("worker sent no Ready within {timeout:?}"))?
         .context("recv Ready")?;
     match ready {
-        WorkerEvent::Ready { version } if version == WORKER_PROTOCOL_VERSION => Ok(()),
+        WorkerEvent::Ready { version } if version == WORKER_PROTOCOL_VERSION => {}
         WorkerEvent::Ready { version } => {
             anyhow::bail!(
                 "worker protocol mismatch: worker={version}, daemon={WORKER_PROTOCOL_VERSION}"
@@ -418,6 +427,11 @@ async fn handshake(
         }
         other => anyhow::bail!("expected Ready from worker, got {other:?}"),
     }
+    let (sock_rd, mut sock_wr) = stream.into_split();
+    codec::send_msg(&mut sock_wr, &WorkerRequest::Start)
+        .await
+        .context("send Start")?;
+    Ok((sock_rd, sock_wr))
 }
 
 /// How a worker's event stream ended.
@@ -1091,27 +1105,53 @@ mod tests {
             (WorkerEvent::Bell, false),
         ];
         for (answer, accepted) in answers {
-            let (daemon, worker) = UnixStream::pair().unwrap();
-            codec::send_with_fd(&worker, &answer, None).await.unwrap();
+            let (daemon, mut worker) = UnixStream::pair().unwrap();
             let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
-            let shook = handshake(&daemon, &hello, fd, GUARD).await;
+            let (shook, told) = tokio::join!(
+                // The halves drop at once, so a worker not told to start
+                // sees the stream end.
+                async { handshake(daemon, &hello, fd, GUARD).await.map(drop) },
+                async {
+                    let (_hello, _fd) =
+                        codec::recv_with_fd::<WorkerRequest>(&worker).await.unwrap();
+                    codec::send_with_fd(&worker, &answer, None).await.unwrap();
+                    told_next(&mut worker).await
+                },
+            );
             assert_eq!(shook.is_ok(), accepted, "{answer:?}: {shook:?}");
+            // Only a worker the daemon keeps is told to start reading the PTY.
+            assert_eq!(
+                matches!(told, Some(WorkerRequest::Start)),
+                accepted,
+                "{answer:?}: {told:?}"
+            );
         }
     }
 
+    /// What the daemon tells `worker` next: `None` once the daemon's end is
+    /// gone without a word.
+    async fn told_next(worker: &mut UnixStream) -> Option<WorkerRequest> {
+        codec::recv_msg(worker).await.unwrap()
+    }
+
     /// A worker that never answers `Hello` fails the handshake at the
-    /// timeout instead of hanging pane creation (issue #207).
+    /// timeout instead of hanging pane creation (issue #207), and is never
+    /// told to start: a `Ready` that comes too late finds nobody.
     #[tokio::test(start_paused = true)]
     async fn a_worker_that_never_sends_ready_times_out() {
-        let (daemon, _silent_worker) = UnixStream::pair().unwrap();
+        let (daemon, mut silent_worker) = UnixStream::pair().unwrap();
         let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
         let started = tokio::time::Instant::now();
 
-        let shook = handshake(&daemon, &WorkerRequest::Shutdown, fd, READY_TIMEOUT).await;
+        let shook = handshake(daemon, &WorkerRequest::Shutdown, fd, READY_TIMEOUT).await;
 
         let err = shook.expect_err("no Ready");
         assert!(err.to_string().contains("no Ready"), "{err}");
         assert!(started.elapsed() >= READY_TIMEOUT);
+        let (_hello, _fd) = codec::recv_with_fd::<WorkerRequest>(&silent_worker)
+            .await
+            .unwrap();
+        assert!(told_next(&mut silent_worker).await.is_none());
     }
 
     /// A worker that sends a garbage frame is killed and reaped, the pane is

@@ -6,8 +6,10 @@ use crate::messages::SessionMeta;
 
 /// Canonical argv appended when the client spawns a local daemon.
 ///
-/// Any site that shells out to `kmuxd` must use this constant so that the
-/// args, bind address, and port are never duplicated or allowed to drift.
+/// Any site that starts a fresh `kmuxd` must use this constant so that the
+/// args, bind address, and port are never duplicated or allowed to drift. A
+/// graceful-restart successor does not: it is started with its predecessor's
+/// own flags, so a restart keeps the listeners the running daemon had.
 ///
 /// Binds to `0.0.0.0` (not `127.0.0.1`) because remote daemons spawned over
 /// SSH must accept QUIC datagrams arriving on the host's external interface

@@ -21,6 +21,7 @@
 //! told to stand down that has not exited within [`SUCCESSOR_STAND_DOWN_GRACE`]
 //! is killed too. Two daemons never serve at once.
 
+use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -32,8 +33,7 @@ use kmux_protocol::control_rpc::handoff_timeouts::{
     self, FROZEN, HOLD, STEP, SUCCESSOR_CONNECT, SUCCESSOR_STAND_DOWN_GRACE,
 };
 use kmux_protocol::control_rpc::{
-    DAEMON_BOOT_ARGS, HANDOFF_PROTOCOL_VERSION, HANDOFF_STOOD_DOWN_EXIT_CODE, HandoffMessage,
-    HandoffPaneMeta,
+    HANDOFF_PROTOCOL_VERSION, HANDOFF_STOOD_DOWN_EXIT_CODE, HandoffMessage, HandoffPaneMeta,
 };
 use nix::unistd::Pid;
 use tokio::net::{UnixListener, UnixStream};
@@ -62,6 +62,7 @@ pub async fn run(
     checkpointer: &mut Option<Checkpointer>,
     committed: &AtomicBool,
     cancel: Cancel,
+    successor_args: &[OsString],
 ) -> anyhow::Result<()> {
     // Without a checkpoint the successor has nothing to rebuild the panes
     // from; refuse before anything has started.
@@ -71,7 +72,7 @@ pub async fn run(
     // No pane may be created from here on: one made after the panes are
     // advertised would be neither transferred nor frozen.
     let gate = app.close_pane_creation().await;
-    let result = hand_off(app, checkpointer, committed, cancel).await;
+    let result = hand_off(app, checkpointer, committed, cancel, successor_args).await;
     if result.is_ok() {
         // This daemon exits: it creates no pane again.
         app.keep_pane_creation_closed(gate);
@@ -87,6 +88,7 @@ async fn hand_off(
     checkpointer: &mut Option<Checkpointer>,
     committed: &AtomicBool,
     cancel: Cancel,
+    successor_args: &[OsString],
 ) -> anyhow::Result<()> {
     let path = kmux_sys::dirs::handoff_socket_path()?;
     let _ = std::fs::remove_file(&path);
@@ -94,7 +96,7 @@ async fn hand_off(
         .with_context(|| format!("binding handoff socket {}", path.display()))?;
     let _guard = PathGuard(path.clone());
 
-    let child = spawn_successor().context("spawning successor daemon")?;
+    let child = spawn_successor(successor_args).context("spawning successor daemon")?;
     info!("handoff: spawned successor; awaiting its connection within {SUCCESSOR_CONNECT:?}");
     let mut successor = Successor { child, peer: None };
 
@@ -465,24 +467,23 @@ async fn roll_back(app: &ServerApp, link: &Link<'_>, cause: &anyhow::Error) {
     let _ = write_frame_within(link.stream, &abort, None, SUCCESSOR_STAND_DOWN_GRACE).await;
 }
 
-/// Spawn the successor daemon: re-exec this binary with the standard boot args
-/// plus `--handoff`, as a direct child in a process group of its own (it does
-/// not daemonize, so this daemon can stop it and learn how it exited). The
-/// binary path is resolved by [`resolve_successor_exe`] so a live upgrade (the
-/// new binary swapped in over our path) re-execs the *new* code.
-fn spawn_successor() -> anyhow::Result<Child> {
+/// Spawn the successor daemon: re-exec this binary with `args` — this
+/// daemon's own flags, so it serves what this one does (issue #234) — as a
+/// direct child in a process group of its own (it does not daemonize, so this
+/// daemon can stop it and learn how it exited). The binary path is resolved by
+/// [`resolve_successor_exe`] so a live upgrade (the new binary swapped in over
+/// our path) re-execs the *new* code.
+fn spawn_successor(args: &[OsString]) -> anyhow::Result<Child> {
     let exe = resolve_successor_exe(
         std::env::current_exe().context("resolving current executable")?,
         std::path::Path::exists,
     )?;
-    let mut args: Vec<&str> = DAEMON_BOOT_ARGS.to_vec();
-    args.push("--handoff");
     // Capture the successor's stdout+stderr (until its log is up) in the boot
     // log so a boot failure (full disk, panic during restore) is visible to
     // `kmux daemon restart` instead of silently timing out the handoff.
     let (out, err) = crate::boot_log_stdio();
     tokio::process::Command::new(&exe)
-        .args(&args)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(err)

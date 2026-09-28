@@ -36,8 +36,9 @@ Two earlier primitives were inadequate and have been removed/repurposed:
 client: kmux daemon restart ──restart──▶ O (control socket) ◀──{attempt}──
 O: spawn the handoff task (the main loop keeps servicing SIGINT/SIGTERM)
 O: close pane creation ; bind handoff.sock
-O: spawn  N = current_exe + DAEMON_BOOT_ARGS + --handoff   (O's direct child,
-   own process group, cwd /; N does not daemonize and takes no pid file)
+O: spawn  N = current_exe --daemon --handoff + O's own serving flags
+   (O's direct child, own process group, cwd /; N does not daemonize and
+   takes no pid file)
 N: connect handoff.sock          (none within 10 s: ask the control socket —
                                   a daemon serving there → N stands down)
 O: accept within 15 s (else kill N, roll back) ; N's pid ← peer credentials
@@ -55,7 +56,8 @@ N ──Ack──▶ O                             the panes are frozen meanwhil
                                         ◀── COMMIT POINT: O reads the Ack
 O: set_all_keep_alive ; quiesce relays    (nothing here can fail the handoff)
 O ──Released──▶ N ; O exits (releases listeners, control/data sockets, pid file)
-N: restore_with_handoff(checkpoint, inherited fds) ; bind sockets ;
+N: restore_with_handoff(checkpoint, inherited fds) ;
+   (a fixed port: wait ≤ 15 s for O to exit) ; bind sockets ;
    claim pid file once O (by its verified pid) has exited ; serve
 client: reconnect on its own (new ports, adopted token) ; re-attach each pane
         afresh — a new daemon process, so a snapshot (issue #208)
@@ -172,7 +174,22 @@ their screens replayed. Later restarts between version-3 builds keep them.
   as `PaneFd`, over `SCM_RIGHTS`.
 - **Seamless seed.** Inherited panes seed their emulator from the snapshot
   **without** the "[kmux: session restored]" separator (`SeedMode::Inherited`);
-  respawned panes keep it (`SeedMode::Respawned`).
+  respawned panes keep it (`SeedMode::Respawned`). Either way the seed
+  reproduces the snapshot cell for cell (`docs/daemon-lifecycle.md` §11).
+- **Same listeners.** N serves what O served: it is started with every flag O
+  was started with that shapes that — `--config`, `--bind`, `--port`,
+  `--tcp-port`, `--cert`, `--key`, `--session-isolation` — with paths made
+  absolute where O resolved them, since N starts in `/` (issue #234). It used
+  to get the client's boot arguments (`DAEMON_BOOT_ARGS`) instead, so a daemon
+  bound to loopback came back from a restart bound to every interface, with
+  an ephemeral port and without its certificate, config file or isolation
+  mode. N re-reads the config file, so a restart does apply an edited
+  `kmuxd.toml`. A fixed port can be bound by one process at a time and O lets
+  go of its listeners only as it exits, so an N with one waits
+  (`PREDECESSOR_EXIT_GRACE`) for O to exit before it binds. An O still running
+  after that still holds them, and a failed bind would end N with the
+  inherited shells in hand, so N binds ephemeral ports on the same addresses
+  instead and logs why.
 
 ## Fault tolerance & idempotency
 
