@@ -269,7 +269,7 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-09-27.
 | `kmux-ghostty` | 20 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
 | `kmux-ffi` | 23 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
 | `kmux-gtk` | 21 | — | keyval→protocol conversion, accel→action table, the connection banner's content and the reconnecting badge (issue #208) | — | **all widget construction and the glib main loop** |
-| `kmux-vt-worker` | 0 | 1 | subprocess smoke: PTY output becomes diffs, a heartbeat `Ping` is answered, and a `Hold` parks the PTY reader until `Release` (issue #207) | — | fd adoption over `SCM_RIGHTS` |
+| `kmux-vt-worker` | 0 | 2 | subprocess smoke: PTY output becomes diffs, a heartbeat `Ping` is answered, and a `Hold` parks the PTY reader until `Release` (issue #207); a worker the daemon never tells to `Start` exits having read nothing, the pane's output still in the PTY (issue #234) | — | fd adoption over `SCM_RIGHTS` |
 | `kmux-ghostty-sys` | 6 | — | ABI version constant | — | Zig internals, all raw bindings |
 | `kmux-worker-protocol` | 6 | — | postcard roundtrip, version constant | — | — |
 | `kmux` | 6 | 6 | CLI parse, completion, diagnostic, binary location | real-binary invocation | `exec` of the platform frontend |

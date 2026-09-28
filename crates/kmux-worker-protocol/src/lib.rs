@@ -18,9 +18,10 @@
 //! One `AF_UNIX`/`SOCK_STREAM` socketpair. The very first frame is the daemon's
 //! [`WorkerRequest::Hello`], which carries the PTY master fd as `SCM_RIGHTS`
 //! ancillary data — the *only* fd that ever crosses the link. The worker adopts
-//! it and replies [`WorkerEvent::Ready`]; that fd-carrying handshake is
-//! lock-step (see [`codec::send_with_fd`] / [`codec::recv_with_fd`]). After the
-//! handshake both ends split the stream and exchange fd-less, length-prefixed
+//! it and replies [`WorkerEvent::Ready`]; the daemon, keeping the worker,
+//! answers [`WorkerRequest::Start`], and only then does the worker read the
+//! PTY. That handshake is lock-step (see [`codec::send_with_fd`] /
+//! [`codec::recv_with_fd`]). After the handshake both ends split the stream and exchange fd-less, length-prefixed
 //! postcard frames concurrently ([`codec::send_msg`] / [`codec::recv_msg`]).
 //!
 //! # Versioning
@@ -50,7 +51,12 @@ use kmux_protocol::messages::{
 /// [`WorkerEvent::Pong`]) and the reader hold for a handoff's final
 /// checkpoint ([`WorkerRequest::Hold`] / [`WorkerEvent::Held`] /
 /// [`WorkerRequest::Release`]).
-pub const WORKER_PROTOCOL_VERSION: u32 = 2;
+///
+/// 3: [`WorkerRequest::Start`] completes the handshake. A worker used to read
+/// the PTY as soon as it sent `Ready`, so one whose `Ready` came too late —
+/// the daemon had given up on it and killed it — took output with it that the
+/// in-process engine replacing it never saw.
+pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 
 /// Daemon → worker control frames.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +82,12 @@ pub enum WorkerRequest {
         /// Live kitty-keyboard capability (intersected across attached clients).
         kitty_keyboard: bool,
     },
+    /// The daemon's answer to [`WorkerEvent::Ready`] (version 3): it keeps
+    /// this worker, which may now read the PTY. A worker reads nothing before
+    /// it, so one the daemon gives up on during the handshake leaves the
+    /// pane's output in the PTY for whatever engine takes the pane over. Any
+    /// other frame, or the link closing, ends the worker instead.
+    Start,
     /// Raw client bytes to write to the PTY (fire-and-forget).
     Input { data: Vec<u8> },
     /// Structured key events; the worker encodes each against the emulator's
@@ -234,6 +246,7 @@ mod tests {
             kitty_graphics: true,
             kitty_keyboard: false,
         });
+        rt_request(&WorkerRequest::Start);
         rt_request(&WorkerRequest::Input {
             data: b"ls -la\n".to_vec(),
         });

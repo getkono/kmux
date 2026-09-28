@@ -40,23 +40,23 @@ async fn next_event(
     }
 }
 
-/// A pane running in a real worker subprocess turns PTY output into cell diffs:
-/// `cat` echoes the input we write, the PTY surfaces it, and the worker emits a
-/// non-empty `Diff`. This exercises the whole boundary — fd passing, handshake,
-/// the steady-state stream — end to end.
-#[tokio::test]
-async fn worker_processes_pty_and_emits_diff() {
-    // The "daemon" owns the PTY; `cat` echoes stdin straight back to stdout.
-    let pty = PtyProcess::spawn(&PtyConfig::new("/bin/cat")).expect("spawn pty");
+/// A real worker subprocess with the first half of the handshake done: it has
+/// adopted the PTY and answered `Hello` with `Ready`.
+struct Started {
+    worker: std::process::Child,
+    stream: UnixStream,
+    /// SIGKILLs the worker and the shell however the test ends: a starved
+    /// worker never sees its socket close.
+    _cleanup: KillOnDrop,
+}
+
+/// Spawn a worker for `pty` exactly as kmuxd does — the "daemon" keeps the
+/// authoritative master fd and hands the worker a `dup` over a socketpair —
+/// and exchange `Hello` for `Ready`.
+async fn start_worker(pty: &PtyProcess) -> Started {
     // Don't let our drop SIGKILL the child out from under the worker.
     pty.set_keep_alive(true);
     let pid = pty.pid.as_raw();
-    let size = TermSize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
     let master_dup = pty.io.dup_owned().expect("dup master fd");
 
     // Socketpair: the worker end is handed to the child on fd 3.
@@ -74,23 +74,25 @@ async fn worker_processes_pty_and_emits_diff() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn worker");
+    let worker = cmd.spawn().expect("spawn worker");
     drop(worker_end); // parent no longer needs the worker end
-    // A failed assertion must not leave the worker (or the shell) running: a
-    // starved worker never sees its socket close.
-    let _cleanup = KillOnDrop(vec![child.id().cast_signed(), pid]);
+    let cleanup = KillOnDrop(vec![worker.id().cast_signed(), pid]);
 
     daemon_end.set_nonblocking(true).expect("nonblocking");
     let stream = UnixStream::from_std(daemon_end).expect("tokio stream");
 
-    // Handshake: send Hello carrying the PTY master fd; expect Ready.
     codec::send_with_fd(
         &stream,
         &WorkerRequest::Hello {
             version: WORKER_PROTOCOL_VERSION,
             pane_id: "eagle/0".into(),
             pid,
-            size,
+            size: TermSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
             scrollback: 1000,
             kitty_graphics: false,
             kitty_keyboard: false,
@@ -99,17 +101,105 @@ async fn worker_processes_pty_and_emits_diff() {
     )
     .await
     .expect("send Hello");
-    let (ready, _fd) = codec::recv_with_fd::<WorkerEvent>(&stream)
-        .await
-        .expect("recv Ready");
+    // `master_dup` drops here: the worker holds its own copy now.
+    let (ready, _fd) = tokio::time::timeout(
+        Duration::from_secs(10),
+        codec::recv_with_fd::<WorkerEvent>(&stream),
+    )
+    .await
+    .expect("Ready within ten seconds")
+    .expect("recv Ready");
     assert!(
         matches!(ready, WorkerEvent::Ready { version } if version == WORKER_PROTOCOL_VERSION),
         "expected Ready, got {ready:?}"
     );
-    drop(master_dup); // the worker holds its own dup now
+    Started {
+        worker,
+        stream,
+        _cleanup: cleanup,
+    }
+}
 
-    // Steady state: write input and expect a non-empty cell diff back.
+/// A worker reads nothing until the daemon has accepted its `Ready`: one the
+/// daemon abandons there (its `Ready` came too late) leaves every byte the
+/// pane printed in the PTY, for the in-process engine that takes the pane
+/// over. It used to start reading the moment it sent `Ready`, so what it read
+/// before the daemon killed it was lost. Out of process because what is under
+/// test is when the worker binary itself first reads its PTY.
+#[tokio::test]
+async fn a_worker_abandoned_after_ready_leaves_the_output_unread() {
+    const PRINTED: &[u8] = b"PRINTED_BEFORE_THE_WORKER";
+    let pty = PtyProcess::spawn(
+        &PtyConfig::new("/bin/sh").args(["-c", "printf PRINTED_BEFORE_THE_WORKER; exec sleep 60"]),
+    )
+    .expect("spawn pty");
+    let master = pty.io.as_raw_fd();
+    assert!(
+        readable_within(master, Duration::from_secs(10)),
+        "the pane printed"
+    );
+
+    let Started {
+        mut worker,
+        stream,
+        _cleanup,
+    } = start_worker(&pty).await;
+    // The daemon gives up on the worker: it closes its end without `Start`.
+    let (mut rd, wr) = stream.into_split();
+    drop(wr);
+    let reported = next_event(&mut rd, is_nonempty_diff).await;
+    assert!(reported.is_none(), "an unconfirmed worker reports nothing");
+    let exited = reap_within(&mut worker, Duration::from_secs(10)).await;
+    assert!(exited.is_some(), "an abandoned worker exits");
+
+    let mut unread = Vec::new();
+    let mut buf = [0u8; 256];
+    while unread.len() < PRINTED.len() && readable_within(master, Duration::from_secs(5)) {
+        match pty.io.try_read_raw(&mut buf) {
+            Ok(n) if n > 0 => unread.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&unread),
+        String::from_utf8_lossy(PRINTED),
+        "what the pane printed is still in the PTY"
+    );
+}
+
+/// Whether `fd` has input within `timeout`.
+fn readable_within(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
+    use nix::libc::{POLLIN, poll, pollfd};
+    let mut fds = [pollfd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    }];
+    let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid `pollfd` for an fd the test keeps open.
+    unsafe { poll(fds.as_mut_ptr(), 1, ms) > 0 }
+}
+
+/// A pane running in a real worker subprocess turns PTY output into cell diffs:
+/// `cat` echoes the input we write, the PTY surfaces it, and the worker emits a
+/// non-empty `Diff`. This exercises the whole boundary — fd passing, handshake,
+/// the steady-state stream — end to end.
+#[tokio::test]
+async fn worker_processes_pty_and_emits_diff() {
+    // The "daemon" owns the PTY; `cat` echoes stdin straight back to stdout.
+    let pty = PtyProcess::spawn(&PtyConfig::new("/bin/cat")).expect("spawn pty");
+    let pid = pty.pid.as_raw();
+    let Started {
+        worker: mut child,
+        stream,
+        _cleanup,
+    } = start_worker(&pty).await;
+
+    // Keep the worker, then write input and expect a non-empty cell diff back.
     let (mut rd, mut wr) = stream.into_split();
+    codec::send_msg(&mut wr, &WorkerRequest::Start)
+        .await
+        .expect("send Start");
     codec::send_msg(
         &mut wr,
         &WorkerRequest::Input {
