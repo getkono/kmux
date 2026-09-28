@@ -38,6 +38,7 @@ use tokio::net::UnixStream;
 use tracing::{info, warn};
 
 use super::{peer_pid, read_frame_within, write_frame_within};
+use crate::config::ListenConfig;
 
 /// The live PTYs pulled from a predecessor that committed.
 pub struct Inherited {
@@ -173,6 +174,27 @@ pub(crate) async fn exits_within(alive: &impl Fn() -> bool, grace: Duration) -> 
         tokio::time::sleep(PREDECESSOR_POLL).await;
     }
     true
+}
+
+/// Wait up to `grace` for the predecessor (`alive` while it runs) to exit when
+/// any of `listeners` binds a fixed port, before this daemon binds them
+/// (issue #234). The predecessor lets go of its listeners only as it exits,
+/// after `Released`, and a fixed port can be bound by one process at a time;
+/// an ephemeral one cannot collide, so with none nothing waits. `Err` when
+/// the predecessor outlives the grace period: binding may then fail.
+pub(crate) async fn await_fixed_ports(
+    listeners: &[ListenConfig],
+    alive: impl Fn() -> bool,
+    grace: Duration,
+) -> anyhow::Result<()> {
+    if !listeners.iter().any(ListenConfig::has_fixed_port) {
+        return Ok(());
+    }
+    if exits_within(&alive, grace).await {
+        Ok(())
+    } else {
+        bail!("the predecessor still runs after {grace:?}; its fixed ports may not bind")
+    }
 }
 
 /// The protocol exchange proper. `Err` says where it stood when it failed.
@@ -654,5 +676,25 @@ mod tests {
         };
         assert!(exits_within(&dies_on_third_check, grace).await);
         assert_eq!(checks.get(), 3);
+    }
+
+    /// A successor with a fixed port waits for its predecessor to exit before
+    /// binding, and says so when it does not (issue #234); with only
+    /// ephemeral ports it binds at once, the predecessor running or not.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_fixed_port_waits_for_the_predecessor_to_exit() {
+        let grace = Duration::from_secs(3);
+        let ephemeral = crate::config::ConfigFile::default().listen;
+        let mut fixed = ephemeral.clone();
+        fixed[0].port = 4433;
+        let started = tokio::time::Instant::now();
+
+        assert!(await_fixed_ports(&ephemeral, || true, grace).await.is_ok());
+        assert_eq!(started.elapsed(), Duration::ZERO, "nothing to wait for");
+
+        assert!(await_fixed_ports(&fixed, || false, grace).await.is_ok());
+        let still_running = await_fixed_ports(&fixed, || true, grace).await;
+        assert!(still_running.is_err(), "{still_running:?}");
+        assert!(started.elapsed() >= grace);
     }
 }

@@ -147,6 +147,71 @@ async fn live_restart_preserves_the_shell(isolated: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A restart does not change where the daemon listens (issue #234): the
+/// successor binds the address and the fixed ports its predecessor was
+/// started with. It used to be started with the client's boot arguments, so
+/// a daemon bound to loopback came back bound to every interface.
+#[tokio::test]
+async fn a_restart_keeps_the_listen_addresses() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let sandbox = Sandbox::new();
+    let cleanup = Cleanup::default();
+    let (quic, tcp) = free_ports();
+    let old_pid = Daemon::new(&sandbox).ports(quic, tcp).spawn(None).await;
+    cleanup.track(old_pid.cast_signed());
+    let before = listening_on(&sandbox.daemon_log());
+
+    let accepted = kmux_client::daemon::restart_daemon_at(&sandbox.socket_path())
+        .await
+        .context("restart control request")?;
+    assert!(
+        matches!(accepted, kmux_client::daemon::RestartReply::Accepted { .. }),
+        "daemon should accept the graceful handoff"
+    );
+    let new_pid = wait_for_daemon(&sandbox, Some(old_pid))
+        .await
+        .context("a successor daemon should take over")?;
+    cleanup.track(new_pid.cast_signed());
+
+    let log = sandbox.daemon_log();
+    let all = listening_on(&log);
+    let wanted = [
+        format!("quic://127.0.0.1:{quic}"),
+        format!("tcp+tls://127.0.0.1:{tcp}"),
+    ];
+    assert_eq!(before, wanted, "the predecessor listened as started");
+    assert_eq!(
+        all.get(before.len()..),
+        Some(&wanted[..]),
+        "the successor listens where its predecessor did; the daemon logged:\n{log}"
+    );
+
+    let _ = kmux_client::daemon::stop_daemon_at(&sandbox.socket_path()).await;
+    Ok(())
+}
+
+/// A QUIC (UDP) and a TCP port on loopback that were free a moment ago.
+fn free_ports() -> (u16, u16) {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("a free UDP port");
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("a free TCP port");
+    let ports = (
+        udp.local_addr().expect("UDP address").port(),
+        tcp.local_addr().expect("TCP address").port(),
+    );
+    drop((udp, tcp));
+    ports
+}
+
+/// Every network address a daemon logged listening on, in order.
+fn listening_on(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| line.split_once("Listening on ").map(|(_, at)| at.trim()))
+        .filter(|at| !at.starts_with("unix://"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// B2: replacing the daemon binary in place (as `cargo install` does) before
 /// `restart` still hands off. Regression guard for `resolve_successor_exe`: on Linux
 /// the atomic rename unlinks the running inode, so `current_exe()` reads back as

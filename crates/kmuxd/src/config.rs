@@ -242,6 +242,15 @@ pub struct ListenConfig {
     pub priority: i32,
 }
 
+impl ListenConfig {
+    /// Whether this enabled network listener binds a port set in advance
+    /// (`--port` / `--tcp-port`), which only one process can hold at a time,
+    /// rather than one the kernel picks.
+    pub fn has_fixed_port(&self) -> bool {
+        self.enabled && self.kind != ListenKind::Unix && self.port != 0
+    }
+}
+
 fn default_bind() -> String {
     // Bind to all IPv4 interfaces by default. We previously used "::" for
     // IPv6 dual-stack, but on hosts where `net.ipv6.bindv6only=1` (some
@@ -838,6 +847,24 @@ kind = "quic"
 port = 8443
 "#;
         assert!(toml::from_str::<ConfigFile>(toml).is_err());
+    }
+
+    /// Only an enabled QUIC or TCP+TLS listener given a port holds one only
+    /// a single process can bind (issue #234).
+    #[test]
+    fn only_an_enabled_network_listener_given_a_port_has_a_fixed_one() {
+        let quic = default_listen()[0].clone();
+        assert!(!quic.has_fixed_port(), "ephemeral by default");
+        let fixed = |kind, enabled| ListenConfig {
+            kind,
+            port: 4433,
+            enabled,
+            ..quic.clone()
+        };
+        assert!(fixed(ListenKind::Quic, true).has_fixed_port());
+        assert!(fixed(ListenKind::TcpTls, true).has_fixed_port());
+        assert!(!fixed(ListenKind::Quic, false).has_fixed_port());
+        assert!(!fixed(ListenKind::Unix, true).has_fixed_port());
     }
 
     #[test]
