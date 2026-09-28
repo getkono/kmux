@@ -18,10 +18,11 @@
 //! One `AF_UNIX`/`SOCK_STREAM` socketpair. The very first frame is the daemon's
 //! [`WorkerRequest::Hello`], which carries the PTY master fd as `SCM_RIGHTS`
 //! ancillary data — the *only* fd that ever crosses the link. The worker adopts
-//! it and replies [`WorkerEvent::Ready`]; the daemon, keeping the worker,
-//! answers [`WorkerRequest::Start`], and only then does the worker read the
-//! PTY. That handshake is lock-step (see [`codec::send_with_fd`] /
-//! [`codec::recv_with_fd`]). After the handshake both ends split the stream and exchange fd-less, length-prefixed
+//! it and replies [`WorkerEvent::Ready`]; that fd-carrying exchange is
+//! lock-step (see [`codec::send_with_fd`] / [`codec::recv_with_fd`]). The
+//! daemon, keeping the worker, then answers [`WorkerRequest::Start`] as the
+//! first streamed frame, and only then does the worker read the PTY. After
+//! the handshake both ends split the stream and exchange fd-less, length-prefixed
 //! postcard frames concurrently ([`codec::send_msg`] / [`codec::recv_msg`]).
 //!
 //! # Versioning
