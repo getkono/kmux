@@ -338,6 +338,28 @@ mod tests {
         assert_eq!(emitted(text("   ").collect()), "\x1b[0m");
     }
 
+    /// Only a wide cell whose character is narrow on its own gets a VS16
+    /// under mode 2027: a character wide on its own is written as it is,
+    /// costing a CJK screen nothing (issue #236).
+    #[test]
+    fn only_a_narrow_base_in_a_wide_cell_gets_a_vs16() {
+        let wide = |c| {
+            let mut cell = CellState {
+                c,
+                ..CellState::default()
+            };
+            cell.attrs.0 |= CellAttrs::WIDE_CHAR;
+            let mut out = Vec::new();
+            emit_cells(&mut out, &[cell]);
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(wide('\u{4e16}'), "\x1b[0m\u{4e16}\x1b[3G\x1b[0m");
+        assert_eq!(
+            wide('\u{26a0}'),
+            "\x1b[0m\u{26a0}\x1b[?2027s\x1b[?2027h\u{fe0f}\x1b[?2027r\x1b[3G\x1b[0m"
+        );
+    }
+
     /// A wide cell whose stored character is narrow on its own — a grapheme
     /// made wide by VS16 under mode 2027, stored as its base — is seeded wide
     /// again, cell for cell, and the rest of the row stays where it was
