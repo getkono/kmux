@@ -776,7 +776,9 @@ The ANSI reproduces the snapshot **cell for cell** (`app/ansi_emit.rs`, issue
 underline, blink, inverse, hidden, strikethrough. An inverse cell's colours
 are stored as displayed (swapped), so they are swapped back to what the
 program set before SGR 7 swaps them again. A wide character's spacer cell is
-not written — the emulator makes it — and only trailing blanks of the default
+not written — the emulator makes it — and the cell after a wide one is placed
+by column, since its stored character may be narrow on its own (the base of a
+grapheme made wide by VS16 under mode 2027). Only trailing blanks of the default
 style are trimmed: a coloured or underlined blank is content. The seed used to
 drop four of the eight attributes, write inverse cells with their colours
 swapped, trim styled blanks, and shift a row one column per wide character.

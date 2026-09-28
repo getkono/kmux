@@ -80,16 +80,18 @@ fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
 /// Only trailing blanks of the default style are trimmed — a fresh emulator
 /// holds those already — while a coloured or underlined blank is content. A
 /// wide character's spacer cell is not written: the emulator makes it when
-/// it writes the character. SGR sequences are coalesced so that only one
+/// it writes the character, and the cell after it is placed by column. SGR sequences are coalesced so that only one
 /// escape is emitted per style-change boundary.
 fn emit_cells(out: &mut Vec<u8>, cells: &[CellState]) {
+    use std::io::Write as _;
+
     let end = cells
         .iter()
         .rposition(|cell| !is_default_blank(cell))
         .map_or(0, |i| i + 1);
 
     let mut prev_style: Option<(CellColor, CellColor, CellAttrs)> = None;
-    for cell in &cells[..end] {
+    for (col, cell) in cells[..end].iter().enumerate() {
         if cell.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
             continue;
         }
@@ -100,6 +102,12 @@ fn emit_cells(out: &mut Vec<u8>, cells: &[CellState]) {
         }
         let mut buf = [0u8; 4];
         out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+        // A wide cell's character may be narrow on its own — the base of a
+        // grapheme a program made wide (VS16 under mode 2027), stored without
+        // the rest — so the next cell is placed by column, not by width.
+        if cell.attrs.contains(CellAttrs::WIDE_CHAR) {
+            let _ = write!(out, "\x1b[{}G", col + 3);
+        }
     }
 
     out.extend_from_slice(b"\x1b[0m");
@@ -278,6 +286,30 @@ mod tests {
         assert_eq!(read_history(&after), history, "the history, cell for cell");
         assert_eq!((seeded.cursor.row, seeded.cursor.col), (1, 2));
         assert_eq!(seeded.history_total, 1, "the one history line, no more");
+    }
+
+    /// A wide cell whose stored character is narrow on its own — a grapheme
+    /// made wide by VS16 under mode 2027, stored as its base — leaves the rest
+    /// of the row where it was (issue #234).
+    #[test]
+    fn a_grapheme_made_wide_keeps_the_rest_of_its_row_in_place() {
+        let before = fixture_term_state(1, 10);
+        lock_term_state(&before).feed("\x1b[?2027h\u{26a0}\u{fe0f}after".as_bytes());
+        let snapshot = lock_term_state(&before).snapshot();
+        assert!(
+            snapshot.cells[0].attrs.contains(CellAttrs::WIDE_CHAR),
+            "the emulator made it wide"
+        );
+
+        let after = fixture_term_state(1, 10);
+        let preamble = snapshot_to_ansi(&snapshot, &[], false);
+        let diffs = Arc::new(Mutex::new(DiffBuffer::new(64 * 1024)));
+        seed_pane_with_preamble(&after, &diffs, &Arc::new(AtomicU64::new(1)), &preamble);
+        let seeded = lock_term_state(&after).snapshot();
+
+        let text = |s: &GridSnapshot| s.cells[2..7].iter().map(|c| c.c).collect::<String>();
+        assert_eq!(text(&seeded), text(&snapshot));
+        assert_eq!(text(&seeded), "after");
     }
 
     /// Every line in `term`'s history, oldest first.
