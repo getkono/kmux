@@ -169,12 +169,17 @@ pub const LEGACY_PROTOCOL_VERSION: u32 = 41;
 
 /// Per-frame zstd compression of the wire codec (frame codec tag 3).
 pub const CAPABILITY_FRAME_ZSTD: &str = "frame.zstd";
+/// The client reads `ClosedSessionEntry::peer` and names it in
+/// `SessionRestore` (issue #228). Only a client that negotiated it is sent a
+/// federated peer's closed sessions: one that ignores `peer` would restore the
+/// peer's word from the hub's own graveyard.
+pub const CAPABILITY_SESSION_CLOSED_PEER: &str = "session.closed.peer";
 /// Every optional capability this build implements.
 ///
 /// Extending this list is the normal way to ship an optional protocol feature:
 /// it is additive, needs no version bump, and appending a name conflicts far
 /// less than editing a shared integer.
-pub const PROTOCOL_CAPABILITIES: &[&str] = &[CAPABILITY_FRAME_ZSTD];
+pub const PROTOCOL_CAPABILITIES: &[&str] = &[CAPABILITY_FRAME_ZSTD, CAPABILITY_SESSION_CLOSED_PEER];
 
 /// Capabilities to offer in `ClientMessage::Auth`.
 pub fn protocol_capabilities() -> Vec<String> {
@@ -319,11 +324,14 @@ mod tests {
 
     #[test]
     fn capability_negotiation_ignores_unknown_extensions() {
-        let offered = vec![
-            CAPABILITY_FRAME_ZSTD.to_string(),
-            "future.example".to_string(),
-        ];
+        let mut offered = protocol_capabilities();
+        offered.push("future.example".to_string());
         assert_eq!(negotiate_capabilities(&offered), protocol_capabilities());
+        // An older peer that offers only `frame.zstd` negotiates only that.
+        assert_eq!(
+            negotiate_capabilities(&[CAPABILITY_FRAME_ZSTD.to_string()]),
+            [CAPABILITY_FRAME_ZSTD]
+        );
     }
 
     #[test]

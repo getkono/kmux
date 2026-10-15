@@ -109,7 +109,8 @@ pub enum FfiLaunchRowKind {
     RemoteNewSession,
     /// Attach an existing session on the remote.
     RemoteExisting,
-    /// Restore a closed (inactive) local session from the graveyard (issue #64).
+    /// Restore a closed (inactive) session from the graveyard (issue #64): the
+    /// daemon's own, or a federated peer's, named by `peer` (issue #228).
     ClosedSession,
     /// Add a new remote (opens the add-remote form).
     AddRemote,
@@ -248,25 +249,19 @@ pub(crate) fn launch_row_to_ffi(row: LaunchRow) -> FfiLaunchRow {
             ..idle
         },
         LaunchRow::ClosedSession {
+            peer,
             word_id,
             name,
             cwd,
             last_active_ms,
-        } => {
-            let when = kmux_app::core::relative_time_label(last_active_ms);
-            let detail = if cwd.is_empty() {
-                when
-            } else {
-                format!("{cwd} · {when}")
-            };
-            FfiLaunchRow {
-                kind: FfiLaunchRowKind::ClosedSession,
-                label: name,
-                detail,
-                word_id: Some(word_id),
-                ..idle
-            }
-        }
+        } => FfiLaunchRow {
+            kind: FfiLaunchRowKind::ClosedSession,
+            label: name,
+            detail: kmux_app::core::closed_session_detail(peer.as_deref(), &cwd, last_active_ms),
+            peer,
+            word_id: Some(word_id),
+            ..idle
+        },
         LaunchRow::AddRemote => FfiLaunchRow {
             kind: FfiLaunchRowKind::AddRemote,
             label: "Add remote…".to_string(),

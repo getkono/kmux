@@ -1787,6 +1787,22 @@ mod tests {
         }
     }
 
+    /// A restore names the graveyard it restores from: a federated peer's
+    /// (issue #228), or the daemon's own.
+    #[test]
+    fn restore_session_names_the_peer_whose_session_it_is() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.restore_session("kite", Some("box"));
+        mgr.restore_session("hawk", None);
+
+        let mut sent = || match rx.try_recv().expect("message sent") {
+            ClientMessage::SessionRestore { word_id, peer, .. } => (word_id, peer),
+            other => panic!("unexpected message: {other:?}"),
+        };
+        assert_eq!(sent(), ("kite".to_string(), Some("box".to_string())));
+        assert_eq!(sent(), ("hawk".to_string(), None));
+    }
+
     #[test]
     fn find_session_by_name_matches_display_name() {
         let mut mgr = make_manager();

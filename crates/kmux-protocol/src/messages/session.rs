@@ -620,6 +620,12 @@ pub struct ClosedSessionEntry {
     pub closed_at_ms: u64,
     /// Number of panes that will be respawned on restore.
     pub pane_count: u32,
+    /// The federated peer whose graveyard holds it, when a hub lists a peer's
+    /// closed session (issue #228); `meta.word_id` is then the peer's word,
+    /// and restoring it names this peer. `None` for the answering daemon's
+    /// own. `#[serde(default)]`: an older daemon never sets it.
+    #[serde(default)]
+    pub peer: Option<PeerId>,
 }
 
 /// Input control mode for a pane.
@@ -921,6 +927,28 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&older).expect("serialize");
         let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert!(!decoded.peer_unreachable);
+    }
+
+    /// A closed entry from a daemon that predates `peer` is that daemon's own
+    /// (issue #228).
+    #[test]
+    fn closed_session_entry_without_a_peer_is_the_daemons_own() {
+        #[derive(Serialize)]
+        struct OlderClosedSessionEntry {
+            meta: SessionMeta,
+            last_active_ms: u64,
+            closed_at_ms: u64,
+            pane_count: u32,
+        }
+        let older = OlderClosedSessionEntry {
+            meta: sample_entry("kmux", None).meta,
+            last_active_ms: 1,
+            closed_at_ms: 2,
+            pane_count: 1,
+        };
+        let bytes = rmp_serde::to_vec_named(&older).expect("serialize");
+        let decoded: ClosedSessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!(decoded.peer, None);
     }
 
     #[test]

@@ -138,6 +138,14 @@ pub enum ClientMessage {
     SessionRestore {
         request_id: RequestId,
         word_id: WordId,
+        /// Whose graveyard: the `peer` of the
+        /// [`super::session::ClosedSessionEntry`] being restored (issue #228).
+        /// `None` restores from this daemon's own; `Some(peer)` is forwarded
+        /// to that peer, which restores its session `word_id`, and the hub
+        /// registers the result under a fresh local word, as for
+        /// `SessionCreate`.
+        #[serde(default)]
+        peer: Option<PeerId>,
     },
 
     /// Create a new pane inside an existing session.
@@ -595,9 +603,12 @@ mod tests {
         let restore = ClientMessage::SessionRestore {
             request_id: 8,
             word_id: "eagle".to_string(),
+            peer: Some("box".to_string()),
         };
         match crate::decode_client(&crate::encode_client(&restore).unwrap()).unwrap() {
-            ClientMessage::SessionRestore { word_id, .. } => assert_eq!(word_id, "eagle"),
+            ClientMessage::SessionRestore { word_id, peer, .. } => {
+                assert_eq!((word_id.as_str(), peer.as_deref()), ("eagle", Some("box")));
+            }
             other => panic!("unexpected: {other:?}"),
         }
 
@@ -614,6 +625,7 @@ mod tests {
                 last_active_ms: 123,
                 closed_at_ms: 456,
                 pane_count: 2,
+                peer: Some("box".to_string()),
             }],
         };
         match crate::decode_server(&crate::encode_server(&result).unwrap()).unwrap() {
@@ -622,6 +634,29 @@ mod tests {
                 assert_eq!(sessions[0].meta.word_id, "eagle");
                 assert_eq!(sessions[0].last_active_ms, 123);
                 assert_eq!(sessions[0].pane_count, 2);
+                assert_eq!(sessions[0].peer.as_deref(), Some("box"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A restore from a client that predates `peer` decodes as one from this
+    /// daemon's own graveyard (issue #228).
+    #[test]
+    fn a_restore_without_a_peer_restores_the_daemons_own() {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type", content = "data")]
+        enum OlderClientMessage {
+            SessionRestore { request_id: u64, word_id: String },
+        }
+        let older = OlderClientMessage::SessionRestore {
+            request_id: 8,
+            word_id: "eagle".to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&older).expect("serialize");
+        match crate::decode_client(&bytes).expect("decode") {
+            ClientMessage::SessionRestore { word_id, peer, .. } => {
+                assert_eq!((word_id.as_str(), peer), ("eagle", None));
             }
             other => panic!("unexpected: {other:?}"),
         }

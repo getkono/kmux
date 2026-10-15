@@ -208,10 +208,10 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
     // The daemon decides compression from client locality + config (issue #59).
     // Self-describing frames make this purely a sender policy: flip the shared
     // toggle the writer/attacher tasks read.
-    let compress = pending
+    state
         .negotiated_capabilities
-        .iter()
-        .any(|capability| capability == CAPABILITY_FRAME_ZSTD)
+        .clone_from(&pending.negotiated_capabilities);
+    let compress = state.negotiated(CAPABILITY_FRAME_ZSTD)
         && state.app.compression.enabled_for(state.transport);
     state.comp_out.set_enabled(compress);
     let server_machine_id = state.app.server_machine_id.clone();

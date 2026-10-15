@@ -199,6 +199,10 @@ fn timing_constants() -> Vec<(&'static str, String)> {
         ("PEER_CONNECT_TIMEOUT", secs(timing::PEER_CONNECT_TIMEOUT)),
         ("PEER_LIST_TIMEOUT", secs(timing::PEER_LIST_TIMEOUT)),
         ("PEER_OVERVIEW_TIMEOUT", secs(timing::PEER_OVERVIEW_TIMEOUT)),
+        (
+            "PEER_CLOSED_LIST_TIMEOUT",
+            secs(timing::PEER_CLOSED_LIST_TIMEOUT),
+        ),
         ("BACKOFF_MIN", secs(timing::BACKOFF_MIN)),
         ("BACKOFF_MAX", secs(timing::BACKOFF_MAX)),
         (

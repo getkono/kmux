@@ -115,6 +115,9 @@ pub struct SharedClientState {
     /// current one releases the registration when its loop ends.
     pub generation: u64,
     pub capabilities: ClientCapabilities,
+    /// The named protocol capabilities this connection negotiated in `Auth`
+    /// (empty until authenticated).
+    pub negotiated_capabilities: Vec<String>,
     /// Set after a valid `Auth`; consumed when `AuthProof` arrives (issue #146).
     pub pending_auth: Option<PendingAuth>,
     /// This connection's verified identity fingerprint, once authenticated.
@@ -159,6 +162,7 @@ impl SharedClientState {
             connection_id: None,
             generation: 0,
             capabilities: ClientCapabilities::default(),
+            negotiated_capabilities: Vec::new(),
             pending_auth: None,
             machine_id: None,
             label: None,
@@ -171,6 +175,11 @@ impl SharedClientState {
             comp_out,
             pending_swap_from: None,
         }
+    }
+
+    /// Whether this connection negotiated the named protocol `capability`.
+    pub fn negotiated(&self, capability: &str) -> bool {
+        self.negotiated_capabilities.iter().any(|c| c == capability)
     }
 
     pub fn send(&self, msg: ServerMessage) {

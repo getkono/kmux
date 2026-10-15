@@ -84,6 +84,7 @@ impl ServerApp {
                 last_active_ms: c.session.last_active_ms,
                 closed_at_ms: c.closed_at_ms,
                 pane_count: c.session.panes.len() as u32,
+                peer: None,
             })
             .collect();
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_active_ms));
@@ -347,6 +348,13 @@ mod tests {
         app.close_session(&word).await.expect("close_session");
         assert!(app.sessions.read().await.get(&word).is_none());
         assert_eq!(words(&app), vec![word.clone()]);
+        // Offered for restore as this daemon's own (issue #228).
+        let offered: Vec<_> = app
+            .closed_session_entries()
+            .into_iter()
+            .map(|e| (e.meta.word_id, e.peer))
+            .collect();
+        assert_eq!(offered, vec![(word.clone(), None)]);
 
         // Restore → session is live again and gone from the graveyard.
         let restored = app.restore_session(&word).await.expect("restore_session");

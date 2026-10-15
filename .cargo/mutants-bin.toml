@@ -59,6 +59,11 @@ exclude_re = [
     # into an `adw::Banner`, which needs a display: the registered GTK
     # widget exception (issue #208).
     'crates/kmux-gtk/src/imp/dialogs\.rs:.*replace update_banner with ',
+    # kmux-gtk's `launch_row_widget` builds an `adw::ActionRow` from a
+    # `LaunchRow`, which needs a display: the same registered widget
+    # exception. What a row says (`closed_session_detail`) and which rows
+    # there are (`launch_rows`) are unit-tested in kmux-app (issue #228).
+    'crates/kmux-gtk/src/imp/dialogs\.rs:.*replace launch_row_widget -> ',
     # kmux-gtk's attention `surface` posts a `gio::Notification` through the
     # running `GApplication`, which needs a display: the same registered
     # widget exception. Its decision, `priority`, is unit-tested (issue #209).

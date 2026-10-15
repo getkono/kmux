@@ -507,11 +507,16 @@ impl AppCore {
             }
         }
 
-        // 4. Restore section: closed local sessions from the daemon's graveyard
-        //    (issue #64), already ordered most-recently-active first.
-        for c in self.mgr.closed_session_list() {
-            if matches(&c.meta.name) || matches(&c.meta.cwd) {
+        // 4. Restore section: closed sessions from the daemon's graveyard (issue
+        //    #64) and its peers' (issue #228), grouped local first, then peer by
+        //    peer; each group keeps the daemon's most-recently-active order.
+        let mut closed: Vec<_> = self.mgr.closed_session_list().iter().collect();
+        closed.sort_by(|a, b| a.peer.cmp(&b.peer));
+        for c in closed {
+            let peer_matches = c.peer.as_deref().is_some_and(&matches);
+            if peer_matches || matches(&c.meta.name) || matches(&c.meta.cwd) {
                 rows.push(LaunchRow::ClosedSession {
+                    peer: c.peer.clone(),
                     word_id: c.meta.word_id.clone(),
                     name: c.meta.name.clone(),
                     cwd: c.meta.cwd.clone(),
@@ -1704,60 +1709,81 @@ mod tests {
         assert!(matches!(rows.last(), Some(LaunchRow::AddRemote)));
     }
 
+    /// The Restore section lists the daemon's closed sessions, then each
+    /// peer's, peer by peer, each group in the daemon's most-recently-active
+    /// order; the search matches a peer too; and a peer's row is restored
+    /// from that peer (issues #64, #228).
     #[test]
-    fn launch_rows_includes_restore_section_filtered_and_ordered() {
+    fn launch_rows_group_closed_sessions_by_peer_and_restore_from_it() {
         use kmux_protocol::messages::ClosedSessionEntry;
-        let (mut core, _rx) = connected_core();
-        // Daemon serves closed sessions already ordered most-recently-active
-        // first; launch_rows preserves that order.
+        let (mut core, mut rx) = connected_core();
+        let closed = |word: &str, peer: Option<&str>| ClosedSessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: word.into(),
+                name: word.into(),
+                cwd: "/tmp".into(),
+            },
+            last_active_ms: 0,
+            closed_at_ms: 0,
+            pane_count: 1,
+            peer: peer.map(Into::into),
+        };
+        // As the hub serves them: most-recently-active first, peers mixed in.
         core.mgr.closed_sessions = vec![
-            ClosedSessionEntry {
-                meta: SessionMeta {
-                    index: 0,
-                    word_id: "hawk".into(),
-                    name: "hawk".into(),
-                    cwd: "/old".into(),
-                },
-                last_active_ms: 2_000,
-                closed_at_ms: 2_000,
-                pane_count: 1,
-            },
-            ClosedSessionEntry {
-                meta: SessionMeta {
-                    index: 1,
-                    word_id: "wren".into(),
-                    name: "wren".into(),
-                    cwd: "/tmp".into(),
-                },
-                last_active_ms: 1_000,
-                closed_at_ms: 1_000,
-                pane_count: 2,
-            },
+            closed("kite", Some("box")),
+            closed("hawk", None),
+            closed("owl", Some("ant")),
+            closed("wren", None),
+            closed("lark", Some("box")),
         ];
+        let restore_rows = |core: &AppCore| -> Vec<(Option<PeerId>, String)> {
+            core.launch_rows()
+                .into_iter()
+                .filter_map(|r| match r {
+                    LaunchRow::ClosedSession { peer, word_id, .. } => Some((peer, word_id)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let row = |peer: Option<&str>, word: &str| (peer.map(Into::into), word.to_string());
 
-        let rows = core.launch_rows();
-        let closed: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| match r {
-                LaunchRow::ClosedSession { word_id, .. } => Some(word_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(closed, vec!["hawk", "wren"]);
+        assert_eq!(
+            restore_rows(&core),
+            vec![
+                row(None, "hawk"),
+                row(None, "wren"),
+                row(Some("ant"), "owl"),
+                row(Some("box"), "kite"),
+                row(Some("box"), "lark"),
+            ]
+        );
         // The Restore rows sit before the trailing AddRemote row.
-        assert!(matches!(rows.last(), Some(LaunchRow::AddRemote)));
+        assert!(matches!(
+            core.launch_rows().last(),
+            Some(LaunchRow::AddRemote)
+        ));
 
-        // The launcher search filters closed sessions too.
-        core.launch_search = "wren".into();
-        let filtered: Vec<String> = core
+        // The launcher search filters closed sessions, by peer too.
+        core.launch_search = "box".into();
+        assert_eq!(
+            restore_rows(&core),
+            vec![row(Some("box"), "kite"), row(Some("box"), "lark")]
+        );
+
+        core.launch_search = "lark".into();
+        core.mode = Mode::LaunchPicker;
+        core.launch_selected = core
             .launch_rows()
             .iter()
-            .filter_map(|r| match r {
-                LaunchRow::ClosedSession { word_id, .. } => Some(word_id.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(filtered, vec!["wren".to_string()]);
+            .position(|r| matches!(r, LaunchRow::ClosedSession { .. }))
+            .expect("the lark row");
+        core.dispatch_action(Action::LaunchSelect);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMessage::SessionRestore { word_id, peer: Some(peer), .. })
+                if word_id == "lark" && peer == "box"
+        ));
     }
 
     #[test]

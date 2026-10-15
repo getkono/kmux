@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PaneProcesses, PeerId, PeerTarget, RequestId, SequenceNo,
-    ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
+    ClientId, ClientMessage, ClosedSessionEntry, PaneProcesses, PeerId, PeerTarget, RequestId,
+    SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
 use kmux_protocol::{format_pane_id, parse_pane_id};
 
@@ -60,15 +60,15 @@ fn lock(conn: &Mutex<PeerConnection>) -> std::sync::MutexGuard<'_, PeerConnectio
     conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// How long the hub waits for its peer's `AuthResult`, session list and
-/// process overview. The overview's is short: the overview polls ~1 Hz and a
-/// slow or dead peer should not stall the whole snapshot — it just
-/// contributes nothing this round (issue #122). A forwarded request waits on
-/// nothing: its answer is routed when it comes (issue #227). See
-/// `docs/protocol.md`.
+/// How long the hub waits for its peer's `AuthResult`, session list, process
+/// overview and closed-session list. The last two are short: the overview
+/// polls ~1 Hz, the closed list fills a launcher as it opens, and a slow or
+/// dead peer should stall neither — it just contributes nothing this round
+/// (issues #122, #228). A forwarded request waits on nothing: its answer is
+/// routed when it comes (issue #227). See `docs/protocol.md`.
 use kmux_protocol::timing::{
-    AUTH_REPLY_TIMEOUT as AUTH_TIMEOUT, PEER_LIST_TIMEOUT as LIST_TIMEOUT,
-    PEER_OVERVIEW_TIMEOUT as OVERVIEW_TIMEOUT,
+    AUTH_REPLY_TIMEOUT as AUTH_TIMEOUT, PEER_CLOSED_LIST_TIMEOUT as CLOSED_LIST_TIMEOUT,
+    PEER_LIST_TIMEOUT as LIST_TIMEOUT, PEER_OVERVIEW_TIMEOUT as OVERVIEW_TIMEOUT,
 };
 
 /// Owns every upstream peer connection and routes federated traffic.
@@ -333,6 +333,11 @@ struct PeerConnection {
     /// process trees — already translated to local pane ids — when the matching
     /// `ProcessOverviewResult` arrives.
     pending_overviews: HashMap<RequestId, oneshot::Sender<Vec<PaneProcesses>>>,
+    /// In-flight hub-initiated `SessionListClosed`s, keyed by upstream request
+    /// id (issue #228). The feed loop completes the oneshot with the peer's own
+    /// closed sessions, tagged with this peer, when the matching
+    /// `ClosedSessionListResult` arrives.
+    pending_closed: HashMap<RequestId, oneshot::Sender<Vec<ClosedSessionEntry>>>,
     /// The local client holding the hub's input lock on a proxied pane, by
     /// local pane id; the hub holds the peer's lock for it (issue #227).
     input_locks: HashMap<String, Requester>,
@@ -362,6 +367,7 @@ impl PeerConnection {
             feed_task: None,
             routes: routes::Routes::default(),
             pending_overviews: HashMap::new(),
+            pending_closed: HashMap::new(),
             input_locks: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
@@ -1006,6 +1012,38 @@ impl PeerManager {
     /// translates them). A dead or slow peer contributes nothing this round
     /// rather than stalling the snapshot.
     pub async fn collect_process_overview(&self) -> Vec<PaneProcesses> {
+        self.collect_from_peers(
+            |conn| &mut conn.pending_overviews,
+            |request_id| ClientMessage::ProcessOverview { request_id },
+            OVERVIEW_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Collect every connected peer's own closed sessions (issue #228), each
+    /// tagged with its peer and still under the peer's word, fanning out one
+    /// `SessionListClosed` per peer as [`Self::collect_process_overview`]
+    /// does. A dead or slow peer contributes nothing.
+    pub async fn collect_closed_sessions(&self) -> Vec<ClosedSessionEntry> {
+        self.collect_from_peers(
+            |conn| &mut conn.pending_closed,
+            |request_id| ClientMessage::SessionListClosed { request_id },
+            CLOSED_LIST_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Send every connected peer `request` under an id of the hub's own,
+    /// registered in the `pending` map the feed loop completes when the
+    /// answer arrives, and gather the answers concurrently. A peer that does
+    /// not answer within `timeout`, or whose link closes, contributes
+    /// nothing.
+    async fn collect_from_peers<T: Send + 'static>(
+        &self,
+        pending: fn(&mut PeerConnection) -> &mut HashMap<RequestId, oneshot::Sender<Vec<T>>>,
+        request: fn(RequestId) -> ClientMessage,
+        timeout: Duration,
+    ) -> Vec<T> {
         let conns: Vec<Arc<Mutex<PeerConnection>>> =
             self.peers.lock().unwrap().values().cloned().collect();
 
@@ -1013,30 +1051,26 @@ impl PeerManager {
         for conn in conns {
             // Allocate a request id, register the oneshot, and dispatch upstream.
             let (rid, rx) = {
-                let mut guard = conn.lock().unwrap();
+                let mut guard = lock(&conn);
                 if guard.dead {
                     continue;
                 }
                 let rid = guard.routes.next_id();
                 let (tx, rx) = oneshot::channel();
-                guard.pending_overviews.insert(rid, tx);
-                if guard
-                    .client_tx
-                    .send(ClientMessage::ProcessOverview { request_id: rid })
-                    .is_err()
-                {
-                    guard.pending_overviews.remove(&rid);
+                pending(&mut guard).insert(rid, tx);
+                if guard.client_tx.send(request(rid)).is_err() {
+                    pending(&mut guard).remove(&rid);
                     continue;
                 }
                 (rid, rx)
             };
             set.spawn(async move {
-                match tokio::time::timeout(OVERVIEW_TIMEOUT, rx).await {
-                    Ok(Ok(panes)) => panes,
+                match tokio::time::timeout(timeout, rx).await {
+                    Ok(Ok(answer)) => answer,
                     // Timed out or the link closed: drop the registration and
                     // move on, so this peer simply contributes nothing.
                     _ => {
-                        conn.lock().unwrap().pending_overviews.remove(&rid);
+                        pending(&mut lock(&conn)).remove(&rid);
                         Vec::new()
                     }
                 }
@@ -1045,8 +1079,8 @@ impl PeerManager {
 
         let mut out = Vec::new();
         while let Some(res) = set.join_next().await {
-            if let Ok(panes) = res {
-                out.extend(panes);
+            if let Ok(answer) = res {
+                out.extend(answer);
             }
         }
         out
