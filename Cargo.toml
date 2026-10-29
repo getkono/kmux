@@ -261,3 +261,15 @@ doc_markdown = "warn"
 redundant_closure_for_method_calls = "warn"
 map_unwrap_or = "warn"
 manual_let_else = "warn"
+
+# Slim dev/test debuginfo so target/ stays small under fast iteration (`test`
+# inherits `dev`, package overrides included). Workspace crates keep line
+# tables, so their backtraces and panics still show file:line; dependency
+# frames keep symbol names but lose file:line. For full debuginfo, override with
+# `CARGO_PROFILE_DEV_DEBUG=2` (workspace crates) or
+# `cargo --config 'profile.dev.package."*".debug=2' ...` (dependencies).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
